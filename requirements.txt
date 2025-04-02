@@ -1,0 +1,13 @@
+fastapi 
+uvicorn 
+python-multipart 
+pymongo 
+python-dotenv 
+boto3 
+google-cloud-storage
+facenet-pytorch 
+torch 
+torchvision 
+numpy 
+pillow 
+scipy
