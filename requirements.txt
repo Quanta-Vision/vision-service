@@ -11,3 +11,5 @@ torchvision
 numpy 
 pillow 
 scipy
+opencv-python
+ultralytics
