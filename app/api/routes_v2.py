@@ -7,19 +7,12 @@ import json
 
 from app.core.storage import save_image
 from app.models.person import add_person, delete_people_by_user_ids, find_person_by_user_id, get_all_people, update_person
+from app.services.face_liveness_antispoof import check_liveness_antispoof_mn3
 from app.services.face_recognition_insight import extract_face_embedding, find_best_match
 from app.models.person import delete_person_by_user_id
 from app.utils.auth import verify_api_key
+from app.utils.utils_function import uploadfile_to_cv2_image
 router_v2 = APIRouter()
-
-import numpy as np
-import cv2
-
-async def uploadfile_to_cv2_image(file: UploadFile):
-    contents = await file.read()
-    np_arr = np.frombuffer(contents, np.uint8)
-    image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-    return image
 
 @router_v2.get("/", tags=["System Health"], summary="Health Check (v2)")
 def health_check():
@@ -134,3 +127,22 @@ async def delete_persons_api(body: UserIdList):
     if deleted_count == 0:
         raise HTTPException(status_code=404, detail="No users were deleted (user_ids not found).")
     return {"msg": f"Deleted {deleted_count} users successfully (v2)."}
+
+
+@router_v2.post("/check-spoofing-mn3", tags=["Spoofing/Liveness"], dependencies=[Depends(verify_api_key)])
+async def check_spoofing_mn3(image: UploadFile = File(...)):
+    img_cv2 = await uploadfile_to_cv2_image(image)
+    score = check_liveness_antispoof_mn3(img_cv2)
+    if score == -1.0:
+        return {
+            "is_live": False,
+            "score": score,
+            "threshold": 0.5,
+            "msg": "No face detected"
+        }
+    return {
+        "is_live": bool(score > 0.5),
+        "score": float(score),
+        "threshold": 0.5
+    }
+
