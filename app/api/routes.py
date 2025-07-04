@@ -5,7 +5,7 @@ import time
 import json
 
 from app.core.storage import save_image
-from app.models.person import add_person, find_person_by_user_id, get_all_people, update_person
+from app.models.person import add_person, find_person_by_user_id, get_people_by_consumer, update_person
 from app.services.face_recognition import extract_face_embedding, find_best_match
 from app.services.person_counter import count_people_in_image
 from app.utils.auth import verify_api_key
