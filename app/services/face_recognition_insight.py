@@ -32,28 +32,51 @@ def get_model():
 # app/services/face_recognition_insight.py
 
 def extract_face_embedding(image: np.ndarray):
-    """
-    Accepts an OpenCV (numpy) image array.
-    """
     model = get_model()
     if image is None:
         return None
     faces = model.get(image)
     if not faces:
         return None
-    return faces[0].embedding
+    emb = faces[0].embedding
+    # L2 normalize
+    emb = emb / np.linalg.norm(emb)
+    return emb
 
-def find_best_match(unknown_embedding, people, threshold=0.5):
+def find_best_match_hybrid(unknown_embedding, people, threshold=1.3):
     """
-    Compare unknown embedding with people's embeddings.
-    Returns: best matching person (dict) or None
+    Hybrid: Accept match if either the average embedding OR any single embedding is below threshold.
     """
     best_match = None
     best_score = float("inf")
     for person in people:
-        for emb in person.get("embeddings", []):
-            dist = np.linalg.norm(unknown_embedding - np.array(emb))
-            if dist < best_score and dist < threshold:
-                best_score = dist
-                best_match = person
+        person['embeddings'] = [
+            (np.array(e) / np.linalg.norm(e)).tolist() for e in person.get('embeddings', [])
+        ]
+        emb_list = person.get("embeddings", [])
+        if not emb_list:
+            continue
+
+        # Compare to average embedding
+        mean_emb = np.mean(np.array(emb_list), axis=0)
+        dist_mean = np.linalg.norm(unknown_embedding - mean_emb)
+
+        # Compare to each embedding
+        min_dist = min(np.linalg.norm(unknown_embedding - np.array(emb)) for emb in emb_list)
+
+        # Take the *best* score (lowest)
+        score = min(dist_mean, min_dist)
+
+        print(
+            f"Hybrid compare {person['personInfo']['user_id']}: mean={dist_mean:.3f}, min={min_dist:.3f}, score={score:.3f}"
+        )
+
+        if score < best_score and score < threshold:
+            best_score = score
+            best_match = person
+
+    if best_match:
+        print(f"[HYBRID] Best match: {best_match['personInfo']['user_id']}, score={best_score}")
+    else:
+        print("[HYBRID] No match found.")
     return best_match

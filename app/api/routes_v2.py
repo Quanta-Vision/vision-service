@@ -14,7 +14,7 @@ from app.models.person import (
     delete_person_by_user_id
 )
 from app.services.face_liveness_antispoof import check_liveness_antispoof_mn3
-from app.services.face_recognition_insight import extract_face_embedding, find_best_match
+from app.services.face_recognition_insight import extract_face_embedding, find_best_match_hybrid
 from app.utils.auth import verify_api_key
 from app.utils.utils_function import uploadfile_to_cv2_image
 from app.utils.consumer import get_consumer
@@ -47,8 +47,6 @@ async def add_person_api(
     user_id: str = Form(...),
     images: List[UploadFile] = File(...)
 ):
-    if len(images) > 10:
-        raise HTTPException(status_code=400, detail="You can upload a maximum of 10 images per person.")
     consumer = get_consumer(request)
     image_paths = []
     embeddings = []
@@ -75,8 +73,6 @@ async def update_person_api(
     user_id: str = Form(...),
     images: List[UploadFile] = File(...)
 ):
-    if len(images) > 10:
-        raise HTTPException(status_code=400, detail="You can upload a maximum of 10 images per person.")
     consumer = get_consumer(request)
     person = find_person_by_user_id(user_id, consumer)
     if not person:
@@ -112,7 +108,7 @@ async def recognize_person(request: Request, image: UploadFile = File(...)):
             "datetime": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         }
     all_people = get_people_by_consumer(consumer)
-    matched = find_best_match(unknown_emb, all_people)
+    matched = find_best_match_hybrid(unknown_emb, all_people)
 
     if matched:
         now = datetime.utcnow()

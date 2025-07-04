@@ -117,3 +117,8 @@ Pull requests are welcome. For major changes, please open an issue first to disc
 
 ## ✅ License
 [MIT](LICENSE)
+
+**Typical InsightFace distances (when using buffalo_l and L2-norm):**
++ Same person, same pose: often < 1.0
++ Same person, different pose/lighting/glasses: can be up to 2.0 – 4.0
++ Different people: often > 5.0, but depends on registration quality
