@@ -37,7 +37,7 @@ async def add_person_api(
 
     person_info = {"name": name, "user_id": user_id}
     add_person(person_info, image_paths, embeddings)
-    return {"msg": "Person registered successfully."}
+    return {"msg": "Person Rollcalled successfully."}
 
 @router.put("/update-person", tags=["Person Regconite"], dependencies=[Depends(verify_api_key)])
 async def update_person_api(

@@ -14,19 +14,33 @@ def get_model():
         _model.prepare(ctx_id=0, det_size=(640, 640))
     return _model
 
-def extract_face_embedding(image_path: str):
+# def extract_face_embedding(image_path: str):
+#     """
+#     Extract face embedding from image using InsightFace.
+#     Returns: np.ndarray (embedding) or None if no face found
+#     """
+#     model = get_model()
+#     img = cv2.imread(image_path)
+#     if img is None:
+#         return None
+#     faces = model.get(img)
+#     if not faces:
+#         return None
+#     # Use first detected face
+#     return faces[0].embedding
+
+# app/services/face_recognition_insight.py
+
+def extract_face_embedding(image: np.ndarray):
     """
-    Extract face embedding from image using InsightFace.
-    Returns: np.ndarray (embedding) or None if no face found
+    Accepts an OpenCV (numpy) image array.
     """
     model = get_model()
-    img = cv2.imread(image_path)
-    if img is None:
+    if image is None:
         return None
-    faces = model.get(img)
+    faces = model.get(image)
     if not faces:
         return None
-    # Use first detected face
     return faces[0].embedding
 
 def find_best_match(unknown_embedding, people, threshold=0.5):

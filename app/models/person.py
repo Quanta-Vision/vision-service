@@ -29,3 +29,11 @@ def update_person(user_id, image_paths, embeddings):
 
 def get_all_people():
     return list(collection.find({}, {"_id": 0}))
+
+def delete_person_by_user_id(user_id):
+    result = collection.delete_one({"personInfo.user_id": user_id})
+    return result.deleted_count
+
+def delete_people_by_user_ids(user_ids):
+    result = collection.delete_many({"personInfo.user_id": {"$in": user_ids}})
+    return result.deleted_count
