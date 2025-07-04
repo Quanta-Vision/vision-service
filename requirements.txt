@@ -13,3 +13,5 @@ pillow
 scipy
 opencv-python
 ultralytics
+insightface 
+onnxruntime
