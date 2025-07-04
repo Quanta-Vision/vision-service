@@ -15,3 +15,4 @@ opencv-python
 ultralytics
 insightface 
 onnxruntime
+# onnxruntime-gpu

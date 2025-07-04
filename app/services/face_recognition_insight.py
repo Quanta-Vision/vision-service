@@ -8,11 +8,32 @@ _model = None
 
 def get_model():
     global _model
-    if _model is None:
-        # Use 'buffalo_l' for best accuracy; ctx_id=0 uses CPU
-        _model = insightface.app.FaceAnalysis(name="buffalo_l", providers=['CPUExecutionProvider'])
+    if _model is not None:
+        return _model
+    try:
+        # Try GPU first (CUDA)
+        _model = insightface.app.FaceAnalysis(
+            name="buffalo_l",
+            providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
+        )
         _model.prepare(ctx_id=0, det_size=(640, 640))
-    return _model
+        print("[InsightFace] Using GPU (CUDAExecutionProvider)")
+        return _model
+    except Exception as e:
+        print("[InsightFace] Failed to load GPU provider:", e)
+    # Fallback: CPU only
+    try:
+        _model = insightface.app.FaceAnalysis(
+            name="buffalo_l",
+            providers=['CPUExecutionProvider']
+        )
+        _model.prepare(ctx_id=-1, det_size=(640, 640))
+        print("[InsightFace] Using CPU (CPUExecutionProvider)")
+        return _model
+    except Exception as e:
+        print("[InsightFace] Failed to load CPU provider:", e)
+        raise RuntimeError("No suitable provider found for InsightFace model!")
+    # return _model
 
 # def extract_face_embedding(image_path: str):
 #     """
