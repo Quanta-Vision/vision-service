@@ -5,8 +5,13 @@ from app.api.routes_v2 import router_v2
 from fastapi import FastAPI
 from app.core.config import PORT
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+import os
+
+os.makedirs("images", exist_ok=True)  # Ensure folder exists
 
 app = FastAPI(title="Vision API")
+app.mount("/images", StaticFiles(directory="images"), name="images")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # or ["http://localhost:3000"] if you want to restrict
