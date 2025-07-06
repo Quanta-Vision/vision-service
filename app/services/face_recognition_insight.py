@@ -64,7 +64,7 @@ def extract_face_embedding(image: np.ndarray):
     emb = emb / np.linalg.norm(emb)
     return emb
 
-def find_best_match_hybrid(unknown_embedding, people, threshold=1.3):
+def find_best_match_hybrid(unknown_embedding, people, threshold=1.0):
     """
     Hybrid: Accept match if either the average embedding OR any single embedding is below threshold.
     """
@@ -74,6 +74,7 @@ def find_best_match_hybrid(unknown_embedding, people, threshold=1.3):
         person['embeddings'] = [
             (np.array(e) / np.linalg.norm(e)).tolist() for e in person.get('embeddings', [])
         ]
+        unknown_embedding = unknown_embedding / np.linalg.norm(unknown_embedding)
         emb_list = person.get("embeddings", [])
         if not emb_list:
             continue
