@@ -1,9 +1,12 @@
-from fastapi import APIRouter, File, HTTPException, UploadFile, Form
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, Form
 from typing import Optional
 import cv2
 import numpy as np
 from ultralytics import YOLO
 import torch
+
+from app.utils.auth import verify_api_key
+from app.utils.consumer import get_consumer
 
 router_counter = APIRouter()
 
@@ -24,12 +27,14 @@ def health_check():
 # mouse, remote, keyboard, cell phone, microwave, oven, toaster,
 # sink, refrigerator, book, clock, vase, scissors, teddy bear,
 # hair drier, toothbrush
-@router_counter.post("/object-count", tags=["Counter"], summary="Object counting")
+@router_counter.post("/object-count", tags=["Counter"], summary="Object counting", dependencies=[Depends(verify_api_key)])
 async def counter_task(
+    request: Request,
     target_object: str = Form(...),
     model_name: str = Form("yolov8m.pt"),
     image: UploadFile = File(...)
-):
+):  
+    consumer = get_consumer(request)
     # Load model dynamically
     try:
         model = YOLO(model_name)
@@ -61,6 +66,7 @@ async def counter_task(
         })
 
     return {
+        "consumer": consumer,
         "target_object": target_object,
         "count": count,
         "detections": detections
