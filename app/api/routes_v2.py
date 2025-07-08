@@ -154,8 +154,11 @@ async def check_spoofing_mn3(image: UploadFile = File(...)):
             "threshold": 0.5,
             "msg": "No face detected"
         }
+    print(f"[LOG] Liveness score: {score:.3f} - {'LIVE' if score > 0.5 else 'SPOOF'}")    
     return {
         "is_live": bool(score > 0.5),
         "score": float(score),
-        "threshold": 0.5
+        "threshold": 0.5,
+        "msg": "Live face detected" if score > 0.5 else "Spoofing detected"
     }
+
