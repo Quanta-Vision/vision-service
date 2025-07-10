@@ -119,9 +119,9 @@ class EnhancedLivenessDetector:
                 face_area = face_width * face_height
                 
                 # Check face size constraints
-                if face_width < 60 or face_height < 60:
+                if face_width < self.min_face_size or face_height < self.min_face_size:
                     continue  # too small (likely background or artifact)
-                if face_width > 1200 or face_height > 1200:
+                if face_width > self.max_face_size or face_height > self.max_face_size:
                     logger.info(f"Skipping very large face: {face_width}x{face_height}")
                     continue  # very close-up face might be distorted
                 
