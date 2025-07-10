@@ -44,10 +44,10 @@ class EnhancedLivenessDetector:
         self._model_lock = threading.Lock()
         
         # Thresholds and parameters
-        self.liveness_threshold = 0.6
+        self.liveness_threshold = 0.5
         self.face_quality_threshold = 0.4
-        self.min_face_size = 80
-        self.max_face_size = 600
+        self.min_face_size = 60
+        self.max_face_size = 1200
         
         # Initialize models
         self._initialize_models()
@@ -103,6 +103,7 @@ class EnhancedLivenessDetector:
         try:
             with self._face_detector_lock:
                 faces = self._insightface_detector.get(image)
+                logger.info(f"Detected {len(faces)} faces")
             
             if not faces:
                 return None
@@ -118,9 +119,11 @@ class EnhancedLivenessDetector:
                 face_area = face_width * face_height
                 
                 # Check face size constraints
-                if (face_width < self.min_face_size or face_height < self.min_face_size or
-                    face_width > self.max_face_size or face_height > self.max_face_size):
-                    continue
+                if face_width < 60 or face_height < 60:
+                    continue  # too small (likely background or artifact)
+                if face_width > 1200 or face_height > 1200:
+                    logger.info(f"Skipping very large face: {face_width}x{face_height}")
+                    continue  # very close-up face might be distorted
                 
                 # Calculate face quality score
                 quality_score = self._calculate_face_quality(image, face)
@@ -434,42 +437,40 @@ class EnhancedLivenessDetector:
             return 0.0
     
     def _ensemble_scoring(self, indicators: Dict[str, float]) -> float:
-        """Ensemble scoring from multiple indicators"""
+        """Improved ensemble scoring from multiple indicators"""
         try:
-            # Define weights for different indicators
+            # Rebalanced weights with more focus on screen artifact detection
             weights = {
-                'texture_richness': 0.20,
-                'color_diversity': 0.15,
-                'skin_realism': 0.15,
-                'high_freq_energy': 0.15,
-                'moire_absence': 0.10,
-                'rgb_independence': 0.10,
+                'texture_richness': 0.15,
+                'color_diversity': 0.10,
+                'skin_realism': 0.10,
+                'high_freq_energy': 0.10,
+                'moire_absence': 0.20,             # ↑ Stronger weight
+                'rgb_independence': 0.15,          # ↑ Stronger weight
                 'natural_lighting': 0.10,
                 'edge_naturalness': 0.05,
-                'reflection_absence': 0.10
+                'reflection_absence': 0.15         # ↑ Stronger weight
             }
-            
-            # Calculate weighted score
+
             total_score = 0.0
             total_weight = 0.0
-            
+
             for indicator, value in indicators.items():
                 if indicator in weights and not np.isnan(value):
-                    weight = weights[indicator]
-                    total_score += value * weight
-                    total_weight += weight
-            
-            if total_weight > 0:
-                final_score = total_score / total_weight
-            else:
-                final_score = 0.5  # Default neutral score
-            
+                    total_score += value * weights[indicator]
+                    total_weight += weights[indicator]
+
+            final_score = total_score / total_weight if total_weight > 0 else 0.5
+            logger.info("--- Spoof Indicators ---")
+            for k, v in indicators.items():
+                logger.info(f"{k:25}: {v:.3f}")
+
             return max(0.0, min(1.0, final_score))
-            
+
         except Exception as e:
             logger.error(f"Error in ensemble scoring: {e}")
             return 0.5
-    
+
     def check_liveness(self, image: np.ndarray, method: LivenessMethod = LivenessMethod.ENSEMBLE) -> LivenessResult:
         """Main liveness detection function with enhanced features"""
         start_time = time.time()
