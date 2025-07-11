@@ -1,3 +1,4 @@
+import cv2
 from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, Request
 from typing import List, Optional, Dict, Any
 from datetime import datetime
