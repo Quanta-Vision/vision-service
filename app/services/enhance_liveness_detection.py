@@ -33,7 +33,7 @@ class LivenessResult:
     recommendations: List[str]
 
 class EnhancedLivenessDetector:
-    """Enhanced liveness detection with multiple methods and improved accuracy"""
+    """Optimized liveness detection with configurable sensitivity"""
     
     def __init__(self, model_path: Optional[str] = None):
         self.model_path = model_path
@@ -43,14 +43,37 @@ class EnhancedLivenessDetector:
         self._face_detector_lock = threading.Lock()
         self._model_lock = threading.Lock()
         
-        # Thresholds and parameters
-        self.liveness_threshold = 0.5
-        self.face_quality_threshold = 0.4
+        # Configurable thresholds - can be adjusted based on your needs
+        self.liveness_threshold = 0.45
+        self._screen_penalty_multiplier = 0.6
+        self._natural_boost_multiplier = 1.15
+        self.face_quality_threshold = 0.25
         self.min_face_size = 60
         self.max_face_size = 1200
         
+        # Sensitivity settings - can be modified
+        self.sensitivity_mode = "lenient"  # "strict", "balanced", "lenient"
+        
         # Initialize models
         self._initialize_models()
+    
+    def set_sensitivity(self, mode: str):
+        """Set detection sensitivity mode"""
+        if mode == "strict":
+            self.liveness_threshold = 0.70
+            self._screen_penalty_multiplier = 1.0
+            self._natural_boost_multiplier = 1.0
+        elif mode == "balanced":
+            self.liveness_threshold = 0.58
+            self._screen_penalty_multiplier = 0.8
+            self._natural_boost_multiplier = 1.05
+        elif mode == "lenient":
+            self.liveness_threshold = 0.45
+            self._screen_penalty_multiplier = 0.6
+            self._natural_boost_multiplier = 1.15
+        
+        self.sensitivity_mode = mode
+        logger.info(f"Sensitivity mode set to: {mode}, threshold: {self.liveness_threshold}")
     
     def _initialize_models(self):
         """Initialize all available models"""
@@ -75,6 +98,9 @@ class EnhancedLivenessDetector:
             
             # Try to initialize InsightFace antispoof model
             self._try_load_antispoof_model()
+            
+            # Set default sensitivity
+            self.set_sensitivity("balanced")
             
         except Exception as e:
             logger.error(f"Error initializing models: {e}")
@@ -120,10 +146,10 @@ class EnhancedLivenessDetector:
                 
                 # Check face size constraints
                 if face_width < self.min_face_size or face_height < self.min_face_size:
-                    continue  # too small (likely background or artifact)
+                    continue
                 if face_width > self.max_face_size or face_height > self.max_face_size:
                     logger.info(f"Skipping very large face: {face_width}x{face_height}")
-                    continue  # very close-up face might be distorted
+                    continue
                 
                 # Calculate face quality score
                 quality_score = self._calculate_face_quality(image, face)
@@ -190,7 +216,7 @@ class EnhancedLivenessDetector:
             
             # 4. Face size score
             face_area = (x2 - x1) * (y2 - y1)
-            size_score = min(1.0, face_area / 40000.0)  # Optimal around 200x200
+            size_score = min(1.0, face_area / 40000.0)
             
             # Weighted combination
             quality = (sharpness_score * 0.3 + brightness_score * 0.25 + 
@@ -203,82 +229,108 @@ class EnhancedLivenessDetector:
             return 0.0
     
     def _advanced_spoof_detection(self, face_img: np.ndarray) -> Dict[str, float]:
-        """Advanced spoof detection with multiple features"""
+        """Advanced spoof detection with configurable sensitivity"""
         try:
             gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
-            
             indicators = {}
             
-            # 1. Texture Analysis
-            # Local Binary Pattern variance
-            def lbp_variance(image, radius=1, n_points=8):
-                from skimage.feature import local_binary_pattern
-                lbp = local_binary_pattern(image, n_points, radius, method='uniform')
-                return np.var(lbp)
+            # 1. Texture Analysis - adjusted for sensitivity
+            texture_scores = []
+            for scale in [3, 5, 7]:
+                kernel = np.ones((scale, scale), np.float32) / (scale * scale)
+                smooth = cv2.filter2D(gray, -1, kernel)
+                texture = cv2.absdiff(gray, smooth)
+                texture_scores.append(np.std(texture))
             
-            try:
-                lbp_var = lbp_variance(gray)
-                indicators['texture_richness'] = min(1.0, lbp_var / 50.0)
-            except ImportError:
-                # Fallback to simpler texture measure
-                laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-                indicators['texture_richness'] = min(1.0, laplacian_var / 300.0)
+            avg_texture = np.mean(texture_scores)
+            # Adjust threshold based on sensitivity
+            texture_threshold = 22.0 if self.sensitivity_mode == "strict" else (20.0 if self.sensitivity_mode == "balanced" else 18.0)
+            indicators['texture_richness'] = min(1.0, avg_texture / texture_threshold)
             
-            # 2. Color Analysis
-            hsv = cv2.cvtColor(face_img, cv2.COLOR_BGR2HSV)
-            
-            # Color diversity
-            h_entropy = self._calculate_entropy(hsv[:,:,0])
-            s_entropy = self._calculate_entropy(hsv[:,:,1])
-            v_entropy = self._calculate_entropy(hsv[:,:,2])
-            indicators['color_diversity'] = (h_entropy + s_entropy + v_entropy) / 3.0
-            
-            # Skin color realism
-            skin_score = self._evaluate_skin_color(face_img)
-            indicators['skin_realism'] = skin_score
-            
-            # 3. Frequency Domain Analysis
-            # High frequency content
+            # 2. Screen Pattern Detection - configurable
             f_transform = np.fft.fft2(gray)
             f_shift = np.fft.fftshift(f_transform)
             magnitude = np.log(np.abs(f_shift) + 1)
             
-            # Energy in high frequencies
             h, w = magnitude.shape
             center_y, center_x = h//2, w//2
-            high_freq_mask = np.zeros((h, w))
-            high_freq_mask[center_y-h//4:center_y+h//4, center_x-w//4:center_x+w//4] = 1
-            high_freq_energy = np.sum(magnitude * (1 - high_freq_mask))
-            indicators['high_freq_energy'] = min(1.0, high_freq_energy / 10000.0)
             
-            # 4. Screen Detection Features
-            # Moiré pattern detection
-            moire_score = self._detect_moire_patterns(gray)
-            indicators['moire_absence'] = 1.0 - moire_score
+            screen_pattern_score = 0
+            for radius in range(8, min(h, w)//4, 4):
+                ring_mask = np.zeros((h, w))
+                y, x = np.ogrid[:h, :w]
+                mask = ((x - center_x)**2 + (y - center_y)**2) >= radius**2
+                mask &= ((x - center_x)**2 + (y - center_y)**2) < (radius + 3)**2
+                ring_mask[mask] = 1
+                
+                ring_energy = np.sum(magnitude * ring_mask)
+                if ring_energy > screen_pattern_score:
+                    screen_pattern_score = ring_energy
             
-            # RGB correlation (screens have high correlation)
+            # Adjust threshold based on sensitivity
+            pattern_threshold = 5200.0 if self.sensitivity_mode == "strict" else (5500.0 if self.sensitivity_mode == "balanced" else 6000.0)
+            indicators['screen_pattern_absence'] = 1.0 - min(1.0, screen_pattern_score / pattern_threshold)
+            
+            # 3. RGB Channel Analysis - configurable
             b, g, r = cv2.split(face_img)
-            correlations = [
-                np.corrcoef(b.flatten(), g.flatten())[0, 1],
-                np.corrcoef(b.flatten(), r.flatten())[0, 1],
-                np.corrcoef(g.flatten(), r.flatten())[0, 1]
-            ]
-            avg_corr = np.mean([abs(c) for c in correlations if not np.isnan(c)])
-            indicators['rgb_independence'] = 1.0 - min(1.0, avg_corr)
+            
+            corr_rg = np.corrcoef(r.flatten(), g.flatten())[0, 1]
+            corr_rb = np.corrcoef(r.flatten(), b.flatten())[0, 1]
+            corr_gb = np.corrcoef(g.flatten(), b.flatten())[0, 1]
+            
+            correlations = [abs(c) for c in [corr_rg, corr_rb, corr_gb] if not np.isnan(c)]
+            avg_correlation = np.mean(correlations) if correlations else 0.8
+            
+            # Adjust sensitivity for RGB correlation
+            rgb_multiplier = 0.95 if self.sensitivity_mode == "strict" else (0.9 if self.sensitivity_mode == "balanced" else 0.85)
+            indicators['rgb_independence'] = 1.0 - min(1.0, avg_correlation * rgb_multiplier)
+            
+            # 4. Enhanced Color Analysis
+            hsv = cv2.cvtColor(face_img, cv2.COLOR_BGR2HSV)
+            lab = cv2.cvtColor(face_img, cv2.COLOR_BGR2LAB)
+            
+            skin_score = self._evaluate_skin_color_enhanced(face_img, hsv, lab)
+            indicators['skin_realism'] = skin_score
+            
+            h_entropy = self._calculate_entropy(hsv[:,:,0])
+            s_entropy = self._calculate_entropy(hsv[:,:,1])
+            v_entropy = self._calculate_entropy(hsv[:,:,2])
+            
+            # Adjust color diversity threshold
+            color_threshold = 13.5 if self.sensitivity_mode == "strict" else (13.0 if self.sensitivity_mode == "balanced" else 12.0)
+            indicators['color_diversity'] = min(1.0, (h_entropy + s_entropy + v_entropy) / color_threshold)
             
             # 5. Lighting Analysis
-            # Natural lighting variation
-            lighting_var = self._analyze_lighting_patterns(gray)
-            indicators['natural_lighting'] = lighting_var
+            lighting_score = self._analyze_lighting_patterns_enhanced(gray)
+            indicators['natural_lighting'] = lighting_score
             
             # 6. Edge Analysis
-            edges = cv2.Canny(gray, 50, 150)
-            edge_density = np.sum(edges > 0) / (gray.shape[0] * gray.shape[1])
-            indicators['edge_naturalness'] = min(1.0, edge_density * 10)
+            edges_canny = cv2.Canny(gray, 30, 100)
+            edges_sobel = cv2.Sobel(gray, cv2.CV_8U, 1, 1, ksize=3)
             
-            # 7. Reflection Detection
-            reflection_score = self._detect_screen_reflections(face_img)
+            edge_density_canny = np.sum(edges_canny > 0) / (gray.shape[0] * gray.shape[1])
+            edge_density_sobel = np.sum(edges_sobel > 50) / (gray.shape[0] * gray.shape[1])
+            
+            edge_score = (edge_density_canny * 0.6 + edge_density_sobel * 0.4) * 12
+            indicators['edge_naturalness'] = min(1.0, edge_score)
+            
+            # 7. Moiré Detection - adjustable sensitivity
+            moire_score = self._detect_moire_enhanced(gray)
+            moire_multiplier = 0.9 if self.sensitivity_mode == "strict" else (0.8 if self.sensitivity_mode == "balanced" else 0.7)
+            indicators['moire_absence'] = 1.0 - (moire_score * moire_multiplier)
+            
+            # 8. Reflection Detection
+            reflection_score = self._detect_screen_reflections_enhanced(face_img)
             indicators['reflection_absence'] = 1.0 - reflection_score
+            
+            # 9. Compression Artifacts
+            compression_score = self._detect_compression_artifacts(gray)
+            compression_multiplier = 0.8 if self.sensitivity_mode == "strict" else (0.7 if self.sensitivity_mode == "balanced" else 0.6)
+            indicators['compression_naturalness'] = 1.0 - (compression_score * compression_multiplier)
+            
+            # 10. Pixel Uniformity
+            uniformity_score = self._analyze_pixel_uniformity(gray)
+            indicators['pixel_naturalness'] = uniformity_score
             
             return indicators
             
@@ -286,170 +338,270 @@ class EnhancedLivenessDetector:
             logger.error(f"Error in advanced spoof detection: {e}")
             return {'error': 1.0}
     
+    def _evaluate_skin_color_enhanced(self, face_img: np.ndarray, hsv: np.ndarray, lab: np.ndarray) -> float:
+        """Enhanced skin color evaluation with sensitivity adjustment"""
+        try:
+            h, s, v = cv2.split(hsv)
+            l, a, b = cv2.split(lab)
+            
+            # Adjust HSV ranges based on sensitivity
+            if self.sensitivity_mode == "lenient":
+                # More relaxed skin detection
+                skin_mask1 = cv2.inRange(hsv, (0, 20, 40), (30, 255, 255))
+                skin_mask2 = cv2.inRange(hsv, (150, 20, 40), (180, 255, 255))
+                lab_skin_mask = cv2.inRange(lab, (40, 110, 110), (220, 160, 160))
+            else:
+                # Standard skin detection
+                skin_mask1 = cv2.inRange(hsv, (0, 25, 50), (25, 255, 255))
+                skin_mask2 = cv2.inRange(hsv, (155, 25, 50), (180, 255, 255))
+                lab_skin_mask = cv2.inRange(lab, (45, 115, 115), (210, 155, 155))
+            
+            hsv_skin_mask = skin_mask1 | skin_mask2
+            hsv_skin_ratio = np.sum(hsv_skin_mask > 0) / (face_img.shape[0] * face_img.shape[1])
+            lab_skin_ratio = np.sum(lab_skin_mask > 0) / (face_img.shape[0] * face_img.shape[1])
+            
+            # RGB ratios
+            b_ch, g_ch, r_ch = cv2.split(face_img)
+            r_mean, g_mean, b_mean = np.mean(r_ch), np.mean(g_ch), np.mean(b_ch)
+            
+            # More lenient RGB scoring for lenient mode
+            if self.sensitivity_mode == "lenient":
+                rgb_order_score = 0.6  # Higher default
+                if r_mean > g_mean > b_mean:
+                    rgb_order_score = 1.0
+                elif r_mean > g_mean or g_mean > b_mean:
+                    rgb_order_score = 0.8
+            else:
+                rgb_order_score = 0.4  # Standard default
+                if r_mean > g_mean > b_mean:
+                    rgb_order_score = 1.0
+                elif r_mean > g_mean or g_mean > b_mean:
+                    rgb_order_score = 0.7
+            
+            # Combine models
+            combined_score = (hsv_skin_ratio * 0.35 + lab_skin_ratio * 0.35 + rgb_order_score * 0.3)
+            
+            # Adjust minimum score based on sensitivity
+            min_score = 0.1 if self.sensitivity_mode == "strict" else (0.15 if self.sensitivity_mode == "balanced" else 0.25)
+            return max(min_score, min(1.0, combined_score))
+            
+        except Exception as e:
+            logger.error(f"Error in enhanced skin color evaluation: {e}")
+            return 0.5
+    
+    def _analyze_lighting_patterns_enhanced(self, gray: np.ndarray) -> float:
+        """Enhanced lighting pattern analysis"""
+        try:
+            lighting_scores = []
+            
+            for blur_size in [15, 31, 63]:
+                if blur_size < min(gray.shape):
+                    lighting_map = cv2.GaussianBlur(gray, (blur_size, blur_size), 0)
+                    
+                    grad_x = cv2.Sobel(lighting_map, cv2.CV_64F, 1, 0, ksize=3)
+                    grad_y = cv2.Sobel(lighting_map, cv2.CV_64F, 0, 1, ksize=3)
+                    grad_magnitude = np.sqrt(grad_x**2 + grad_y**2)
+                    
+                    grad_std = np.std(grad_magnitude)
+                    grad_mean = np.mean(grad_magnitude)
+                    
+                    if grad_mean > 0:
+                        multiplier = 1.5 if self.sensitivity_mode == "strict" else (1.3 if self.sensitivity_mode == "balanced" else 1.0)
+                        consistency = 1.0 - min(1.0, grad_std / (grad_mean * multiplier))
+                        min_consistency = 0.15 if self.sensitivity_mode == "strict" else (0.2 if self.sensitivity_mode == "balanced" else 0.3)
+                        lighting_scores.append(max(min_consistency, consistency))
+            
+            default_score = 0.25 if self.sensitivity_mode == "strict" else (0.3 if self.sensitivity_mode == "balanced" else 0.4)
+            return max(default_score, np.mean(lighting_scores)) if lighting_scores else default_score
+            
+        except Exception as e:
+            logger.error(f"Error in enhanced lighting analysis: {e}")
+            return 0.4
+    
+    def _detect_moire_enhanced(self, gray: np.ndarray) -> float:
+        """Enhanced moiré pattern detection"""
+        try:
+            kernel = np.array([[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]])
+            filtered = cv2.filter2D(gray, -1, kernel)
+            
+            f_transform = np.fft.fft2(filtered)
+            f_shift = np.fft.fftshift(f_transform)
+            magnitude = np.abs(f_shift)
+            
+            h, w = magnitude.shape
+            center_y, center_x = h//2, w//2
+            
+            max_periodic_energy = 0
+            
+            for radius in range(5, min(h, w)//3, 3):
+                angles = np.linspace(0, 2*np.pi, 16, endpoint=False)
+                energies = []
+                
+                for angle in angles:
+                    y = int(center_y + radius * np.sin(angle))
+                    x = int(center_x + radius * np.cos(angle))
+                    if 0 <= y < h and 0 <= x < w:
+                        energies.append(magnitude[y, x])
+                
+                if energies:
+                    energy_variance = np.var(energies)
+                    max_periodic_energy = max(max_periodic_energy, energy_variance)
+            
+            # Adjust threshold based on sensitivity
+            moire_threshold = 2300.0 if self.sensitivity_mode == "strict" else (2500.0 if self.sensitivity_mode == "balanced" else 2800.0)
+            moire_score = min(1.0, max_periodic_energy / moire_threshold)
+            return moire_score
+            
+        except Exception as e:
+            logger.error(f"Error in enhanced moiré detection: {e}")
+            return 0.0
+    
+    def _detect_screen_reflections_enhanced(self, face_img: np.ndarray) -> float:
+        """Enhanced screen reflection detection"""
+        try:
+            gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+            
+            reflection_scores = []
+            
+            # Adjust percentiles based on sensitivity
+            percentiles = [90, 94, 97] if self.sensitivity_mode == "strict" else ([91, 95, 98] if self.sensitivity_mode == "balanced" else [92, 96, 99])
+            
+            for percentile in percentiles:
+                threshold = np.percentile(gray, percentile)
+                bright_mask = gray > threshold
+                
+                num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+                    bright_mask.astype(np.uint8), connectivity=8
+                )
+                
+                total_area = gray.shape[0] * gray.shape[1]
+                large_bright_area = 0
+                
+                area_threshold = 0.01 if self.sensitivity_mode == "strict" else (0.015 if self.sensitivity_mode == "balanced" else 0.02)
+                
+                for i in range(1, num_labels):
+                    area = stats[i, cv2.CC_STAT_AREA]
+                    if area > total_area * area_threshold:
+                        large_bright_area += area
+                
+                reflection_score = large_bright_area / total_area
+                reflection_scores.append(reflection_score)
+            
+            multiplier = 10.0 if self.sensitivity_mode == "strict" else (9.0 if self.sensitivity_mode == "balanced" else 8.0)
+            return min(1.0, np.mean(reflection_scores) * multiplier)
+            
+        except Exception as e:
+            logger.error(f"Error in enhanced reflection detection: {e}")
+            return 0.0
+    
+    def _detect_compression_artifacts(self, gray: np.ndarray) -> float:
+        """Detect compression artifacts"""
+        try:
+            block_size = 8
+            h, w = gray.shape
+            
+            artifact_scores = []
+            
+            for y in range(0, h - block_size, block_size):
+                for x in range(0, w - block_size, block_size):
+                    block = gray[y:y+block_size, x:x+block_size].astype(np.float32)
+                    
+                    dct = cv2.dct(block)
+                    high_freq = dct[4:, 4:]
+                    high_freq_energy = np.sum(high_freq**2)
+                    artifact_scores.append(high_freq_energy)
+            
+            if artifact_scores:
+                avg_energy = np.mean(artifact_scores)
+                # Adjust threshold based on sensitivity
+                energy_threshold = 1100.0 if self.sensitivity_mode == "strict" else (1200.0 if self.sensitivity_mode == "balanced" else 1400.0)
+                compression_score = 1.0 - min(1.0, avg_energy / energy_threshold)
+                return compression_score
+            
+            return 0.0
+            
+        except Exception as e:
+            logger.error(f"Error detecting compression artifacts: {e}")
+            return 0.0
+    
+    def _analyze_pixel_uniformity(self, gray: np.ndarray) -> float:
+        """Analyze pixel uniformity"""
+        try:
+            kernel = np.ones((3, 3), np.float32) / 9
+            smooth = cv2.filter2D(gray, -1, kernel)
+            variation = cv2.absdiff(gray, smooth)
+            
+            variation_std = np.std(variation)
+            
+            grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+            grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+            grad_magnitude = np.sqrt(grad_x**2 + grad_y**2)
+            
+            grad_entropy = self._calculate_entropy(grad_magnitude.astype(np.uint8))
+            
+            # Adjust thresholds based on sensitivity
+            var_divisor = 8.5 if self.sensitivity_mode == "strict" else (9.0 if self.sensitivity_mode == "balanced" else 9.5)
+            entropy_divisor = 6.5 if self.sensitivity_mode == "strict" else (7.0 if self.sensitivity_mode == "balanced" else 7.5)
+            
+            uniformity_score = min(1.0, (variation_std / var_divisor + grad_entropy / entropy_divisor) / 2.0)
+            
+            min_score = 0.15 if self.sensitivity_mode == "strict" else (0.2 if self.sensitivity_mode == "balanced" else 0.3)
+            return max(min_score, uniformity_score)
+            
+        except Exception as e:
+            logger.error(f"Error analyzing pixel uniformity: {e}")
+            return 0.4
+    
     def _calculate_entropy(self, image: np.ndarray) -> float:
         """Calculate image entropy"""
         try:
             hist = cv2.calcHist([image], [0], None, [256], [0, 256])
             hist = hist.flatten()
-            hist = hist[hist > 0]  # Remove zero entries
-            hist = hist / hist.sum()  # Normalize
+            hist = hist[hist > 0]
+            hist = hist / hist.sum()
             entropy = -np.sum(hist * np.log2(hist))
-            return entropy / 8.0  # Normalize to [0, 1]
+            return entropy
         except Exception:
             return 0.0
     
-    def _evaluate_skin_color(self, face_img: np.ndarray) -> float:
-        """Evaluate skin color realism"""
+    def _optimized_ensemble_scoring(self, indicators: Dict[str, float]) -> float:
+        """Optimized ensemble scoring with configurable sensitivity"""
         try:
-            # Convert to different color spaces
-            hsv = cv2.cvtColor(face_img, cv2.COLOR_BGR2HSV)
-            lab = cv2.cvtColor(face_img, cv2.COLOR_BGR2LAB)
+            # Check for strong screen indicators
+            moire_score = indicators.get('moire_absence', 1.0)
+            rgb_score = indicators.get('rgb_independence', 1.0)
+            screen_pattern_score = indicators.get('screen_pattern_absence', 1.0)
             
-            # Skin color ranges in HSV
-            # Typical skin hue range: 0-30 and 150-180
-            h = hsv[:,:,0]
-            s = hsv[:,:,1]
-            v = hsv[:,:,2]
+            # Adjust thresholds based on sensitivity mode
+            if self.sensitivity_mode == "strict":
+                moire_threshold, rgb_threshold, pattern_threshold = 0.5, 0.5, 0.7
+            elif self.sensitivity_mode == "balanced":
+                moire_threshold, rgb_threshold, pattern_threshold = 0.4, 0.4, 0.6
+            else:  # lenient
+                moire_threshold, rgb_threshold, pattern_threshold = 0.3, 0.3, 0.5
             
-            # Create skin mask
-            skin_mask1 = cv2.inRange(hsv, (0, 20, 20), (30, 255, 255))
-            skin_mask2 = cv2.inRange(hsv, (150, 20, 20), (180, 255, 255))
-            skin_mask = skin_mask1 | skin_mask2
+            # Count strong negative indicators
+            strong_screen_indicators = 0
+            if moire_score < moire_threshold:
+                strong_screen_indicators += 1
+            if rgb_score < rgb_threshold:
+                strong_screen_indicators += 1
+            if screen_pattern_score < pattern_threshold:
+                strong_screen_indicators += 1
             
-            skin_ratio = np.sum(skin_mask > 0) / (face_img.shape[0] * face_img.shape[1])
-            
-            # Additional checks in LAB space
-            l_mean = np.mean(lab[:,:,0])
-            a_mean = np.mean(lab[:,:,1])
-            b_mean = np.mean(lab[:,:,2])
-            
-            # Typical skin values in LAB
-            l_score = 1.0 - abs(l_mean - 120) / 120.0
-            a_score = 1.0 - abs(a_mean - 140) / 40.0
-            b_score = 1.0 - abs(b_mean - 135) / 35.0
-            
-            combined_score = (skin_ratio * 0.4 + l_score * 0.2 + 
-                             a_score * 0.2 + b_score * 0.2)
-            
-            return max(0.0, min(1.0, combined_score))
-            
-        except Exception as e:
-            logger.error(f"Error evaluating skin color: {e}")
-            return 0.5
-    
-    def _detect_moire_patterns(self, gray: np.ndarray) -> float:
-        """Detect moiré patterns that indicate screen capture"""
-        try:
-            # Apply band-pass filter to detect periodic patterns
-            kernel = np.array([[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]])
-            filtered = cv2.filter2D(gray, -1, kernel)
-            
-            # Look for periodic patterns using FFT
-            f_transform = np.fft.fft2(filtered)
-            f_shift = np.fft.fftshift(f_transform)
-            magnitude = np.abs(f_shift)
-            
-            # Check for strong periodic components
-            h, w = magnitude.shape
-            center_y, center_x = h//2, w//2
-            
-            # Sample points around center in circular pattern
-            angles = np.linspace(0, 2*np.pi, 16, endpoint=False)
-            radii = [min(h, w) // 8, min(h, w) // 4]
-            
-            max_magnitude = 0
-            for radius in radii:
-                for angle in angles:
-                    y = int(center_y + radius * np.sin(angle))
-                    x = int(center_x + radius * np.cos(angle))
-                    if 0 <= y < h and 0 <= x < w:
-                        max_magnitude = max(max_magnitude, magnitude[y, x])
-            
-            # Normalize and invert (higher moire = lower score)
-            moire_score = min(1.0, max_magnitude / 1000.0)
-            return moire_score
-            
-        except Exception as e:
-            logger.error(f"Error detecting moire patterns: {e}")
-            return 0.0
-    
-    def _analyze_lighting_patterns(self, gray: np.ndarray) -> float:
-        """Analyze lighting patterns for naturalness"""
-        try:
-            # Apply Gaussian blur to get lighting map
-            lighting_map = cv2.GaussianBlur(gray, (31, 31), 0)
-            
-            # Calculate lighting variation
-            lighting_std = np.std(lighting_map)
-            
-            # Natural faces have gradual lighting changes
-            # Screens tend to have more uniform lighting
-            gradient_x = cv2.Sobel(lighting_map, cv2.CV_64F, 1, 0, ksize=3)
-            gradient_y = cv2.Sobel(lighting_map, cv2.CV_64F, 0, 1, ksize=3)
-            gradient_magnitude = np.sqrt(gradient_x**2 + gradient_y**2)
-            
-            # Natural lighting should have moderate gradients
-            avg_gradient = np.mean(gradient_magnitude)
-            
-            # Score based on lighting variation and gradient
-            lighting_score = min(1.0, lighting_std / 30.0)
-            gradient_score = min(1.0, avg_gradient / 20.0)
-            
-            return (lighting_score + gradient_score) / 2.0
-            
-        except Exception as e:
-            logger.error(f"Error analyzing lighting patterns: {e}")
-            return 0.5
-    
-    def _detect_screen_reflections(self, face_img: np.ndarray) -> float:
-        """Detect screen reflections and glare"""
-        try:
-            gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
-            
-            # Look for bright spots that might be reflections
-            bright_threshold = np.percentile(gray, 95)
-            bright_mask = gray > bright_threshold
-            
-            # Find connected components of bright regions
-            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-                bright_mask.astype(np.uint8), connectivity=8
-            )
-            
-            # Analyze bright regions
-            total_area = gray.shape[0] * gray.shape[1]
-            bright_area_ratio = np.sum(bright_mask) / total_area
-            
-            # Large bright regions might indicate screen glare
-            large_bright_regions = 0
-            for i in range(1, num_labels):  # Skip background
-                area = stats[i, cv2.CC_STAT_AREA]
-                if area > total_area * 0.02:  # > 2% of face area
-                    large_bright_regions += 1
-            
-            # Screen reflection score
-            reflection_score = (bright_area_ratio * 5.0 + 
-                               large_bright_regions * 0.3)
-            
-            return min(1.0, reflection_score)
-            
-        except Exception as e:
-            logger.error(f"Error detecting screen reflections: {e}")
-            return 0.0
-    
-    def _ensemble_scoring(self, indicators: Dict[str, float]) -> float:
-        """Improved ensemble scoring from multiple indicators"""
-        try:
-            # Rebalanced weights with more focus on screen artifact detection
+            # Balanced weights
             weights = {
-                'texture_richness': 0.15,
-                'color_diversity': 0.10,
-                'skin_realism': 0.10,
-                'high_freq_energy': 0.10,
-                'moire_absence': 0.20,             # ↑ Stronger weight
-                'rgb_independence': 0.15,          # ↑ Stronger weight
-                'natural_lighting': 0.10,
-                'edge_naturalness': 0.05,
-                'reflection_absence': 0.15         # ↑ Stronger weight
+                'texture_richness': 0.13,
+                'screen_pattern_absence': 0.14,
+                'rgb_independence': 0.12,
+                'skin_realism': 0.11,
+                'color_diversity': 0.09,
+                'natural_lighting': 0.11,
+                'edge_naturalness': 0.09,
+                'moire_absence': 0.12,
+                'reflection_absence': 0.08,
+                'compression_naturalness': 0.06,
+                'pixel_naturalness': 0.10
             }
 
             total_score = 0.0
@@ -460,19 +612,51 @@ class EnhancedLivenessDetector:
                     total_score += value * weights[indicator]
                     total_weight += weights[indicator]
 
-            final_score = total_score / total_weight if total_weight > 0 else 0.5
-            logger.info("--- Spoof Indicators ---")
+            base_score = total_score / total_weight if total_weight > 0 else 0.5
+            
+            # Apply penalties based on sensitivity and screen indicators
+            final_score = base_score
+            
+            # Make penalty less harsh (tune as needed)
+            if strong_screen_indicators >= 2:
+                penalty = 0.85 if self.sensitivity_mode == "strict" else (0.88 if self.sensitivity_mode == "balanced" else 0.9)
+                final_score *= penalty
+                logger.info(f"Multiple screen indicators detected: {strong_screen_indicators}")
+            elif strong_screen_indicators == 1:
+                penalty = 0.92 if self.sensitivity_mode == "strict" else (0.95 if self.sensitivity_mode == "balanced" else 0.97)
+                final_score *= penalty
+                logger.info(f"One screen indicator detected: {strong_screen_indicators}")
+            
+            # Boost score if face_quality or skin_realism is high, to help real images
+            skin_realism = indicators.get('skin_realism', 0)
+            if skin_realism > 0.8:
+                final_score = min(1.0, final_score + 0.15)
+                
+            # Bonus: if texture_richness and edge_naturalness are both high, add a bit more
+            if indicators.get('texture_richness', 0) > 0.6 and indicators.get('edge_naturalness', 0) > 0.8:
+                final_score = min(1.0, final_score + 0.05)
+
+            # Apply boost for natural characteristics based on sensitivity
+            skin_realism = indicators.get('skin_realism', 0)
+            natural_lighting = indicators.get('natural_lighting', 0)
+            
+            if skin_realism > 0.7 and natural_lighting > 0.5 and strong_screen_indicators == 0:
+                boost = getattr(self, '_natural_boost_multiplier', 1.05)
+                final_score *= boost
+            
+            logger.info("--- Optimized Spoof Indicators ---")
             for k, v in indicators.items():
                 logger.info(f"{k:25}: {v:.3f}")
+            logger.info(f"Sensitivity: {self.sensitivity_mode}, Base: {base_score:.3f}, Screen indicators: {strong_screen_indicators}, Final: {final_score:.3f}")
 
             return max(0.0, min(1.0, final_score))
 
         except Exception as e:
-            logger.error(f"Error in ensemble scoring: {e}")
+            logger.error(f"Error in optimized ensemble scoring: {e}")
             return 0.5
 
     def check_liveness(self, image: np.ndarray, method: LivenessMethod = LivenessMethod.ENSEMBLE) -> LivenessResult:
-        """Main liveness detection function with enhanced features"""
+        """Main liveness detection function with optimized scoring"""
         start_time = time.time()
         
         try:
@@ -523,16 +707,16 @@ class EnhancedLivenessDetector:
                 method_used = "insightface_model"
                 
             elif method == LivenessMethod.MULTI_FEATURE or method == LivenessMethod.ENSEMBLE:
-                # Advanced multi-feature analysis
+                # Optimized multi-feature analysis
                 spoof_indicators = self._advanced_spoof_detection(face_resized)
-                confidence = self._ensemble_scoring(spoof_indicators)
-                method_used = "multi_feature_ensemble"
+                confidence = self._optimized_ensemble_scoring(spoof_indicators)
+                method_used = f"optimized_ensemble_v5_{self.sensitivity_mode}"
                 
             else:
-                # Fallback to basic analysis
+                # Fallback to optimized analysis
                 spoof_indicators = self._advanced_spoof_detection(face_resized)
-                confidence = self._ensemble_scoring(spoof_indicators)
-                method_used = "fallback_analysis"
+                confidence = self._optimized_ensemble_scoring(spoof_indicators)
+                method_used = f"optimized_fallback_{self.sensitivity_mode}"
             
             # Generate recommendations
             recommendations = self._generate_recommendations(confidence, spoof_indicators, face_quality)
@@ -566,12 +750,10 @@ class EnhancedLivenessDetector:
     def _onnx_liveness_check(self, face_img: np.ndarray) -> float:
         """ONNX model liveness check"""
         try:
-            # Preprocess image
             img_rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
             img_norm = img_rgb.astype(np.float32) / 255.0
             img_norm = img_norm.transpose(2, 0, 1)[None]
             
-            # Run inference
             input_name = self._onnx_session.get_inputs()[0].name
             output = self._onnx_session.run(None, {input_name: img_norm})[0]
             score = float(output[0][0])
@@ -594,38 +776,70 @@ class EnhancedLivenessDetector:
             return 0.0
     
     def _generate_recommendations(self, confidence: float, indicators: Dict[str, float], face_quality: float) -> List[str]:
-        """Generate user recommendations based on detection results"""
+        """Generate user recommendations based on detection results and sensitivity"""
         recommendations = []
         
-        if confidence < 0.3:
-            recommendations.append("Very low liveness confidence - likely spoofing attempt")
-        elif confidence < 0.6:
-            recommendations.append("Low liveness confidence - please retry")
+        # Adjust confidence interpretation based on sensitivity
+        if self.sensitivity_mode == "strict":
+            if confidence < 0.4:
+                recommendations.append("Very low liveness confidence - likely spoofing attempt")
+            elif confidence < 0.6:
+                recommendations.append("Low liveness confidence - possible spoofing")
+            elif confidence < 0.7:
+                recommendations.append("Moderate confidence - borderline detection")
+            elif confidence < 0.8:
+                recommendations.append("Good confidence - likely live")
+            else:
+                recommendations.append("High confidence live detection")
+        elif self.sensitivity_mode == "balanced":
+            if confidence < 0.3:
+                recommendations.append("Very low liveness confidence - likely spoofing attempt")
+            elif confidence < 0.5:
+                recommendations.append("Low liveness confidence - possible spoofing")
+            elif confidence < 0.58:
+                recommendations.append("Moderate confidence - borderline detection")
+            elif confidence < 0.75:
+                recommendations.append("Good confidence - likely live")
+            else:
+                recommendations.append("High confidence live detection")
+        else:  # lenient
+            if confidence < 0.25:
+                recommendations.append("Very low liveness confidence - likely spoofing attempt")
+            elif confidence < 0.4:
+                recommendations.append("Low liveness confidence - possible spoofing")
+            elif confidence < 0.45:
+                recommendations.append("Moderate confidence - borderline detection")
+            elif confidence < 0.7:
+                recommendations.append("Good confidence - likely live")
+            else:
+                recommendations.append("High confidence live detection")
         
-        if face_quality < 0.6:
+        if face_quality < 0.3:
             recommendations.append("Improve image quality - move closer or improve lighting")
         
-        # Specific recommendations based on indicators
-        if indicators.get('texture_richness', 1.0) < 0.4:
-            recommendations.append("Image appears too smooth - ensure natural facial texture")
+        # Specific recommendations based on indicators and sensitivity
+        texture_threshold = 0.3 if self.sensitivity_mode == "strict" else (0.25 if self.sensitivity_mode == "balanced" else 0.2)
+        if indicators.get('texture_richness', 1.0) < texture_threshold:
+            recommendations.append("Image appears very smooth - check for filters or processing")
         
-        if indicators.get('skin_realism', 1.0) < 0.4:
+        skin_threshold = 0.5 if self.sensitivity_mode == "strict" else (0.4 if self.sensitivity_mode == "balanced" else 0.3)
+        if indicators.get('skin_realism', 1.0) < skin_threshold:
             recommendations.append("Skin color appears unnatural - check lighting conditions")
         
-        if indicators.get('rgb_independence', 1.0) < 0.3:
-            recommendations.append("Possible screen detection - avoid displaying photos on screen")
+        rgb_threshold = 0.4 if self.sensitivity_mode == "strict" else (0.3 if self.sensitivity_mode == "balanced" else 0.25)
+        if indicators.get('rgb_independence', 1.0) < rgb_threshold:
+            recommendations.append("High RGB correlation detected - avoid screen photos")
         
-        if indicators.get('reflection_absence', 1.0) < 0.3:
-            recommendations.append("Screen glare detected - avoid reflective surfaces")
+        if indicators.get('reflection_absence', 1.0) < 0.4:
+            recommendations.append("Reflections detected - avoid glossy surfaces")
         
-        if indicators.get('moire_absence', 1.0) < 0.3:
-            recommendations.append("Moiré patterns detected - avoid photographing screens")
+        moire_threshold = 0.5 if self.sensitivity_mode == "strict" else (0.4 if self.sensitivity_mode == "balanced" else 0.3)
+        if indicators.get('moire_absence', 1.0) < moire_threshold:
+            recommendations.append("Moiré patterns detected - avoid screen interference")
         
-        if not recommendations:
-            if confidence > 0.8:
-                recommendations.append("High confidence live detection")
-            else:
-                recommendations.append("Moderate confidence - consider retrying for better results")
+        pattern_threshold = 0.7 if self.sensitivity_mode == "strict" else (0.6 if self.sensitivity_mode == "balanced" else 0.5)
+        if indicators.get('screen_pattern_absence', 1.0) < pattern_threshold:
+            recommendations.append("Screen patterns detected - use direct camera capture")
         
         return recommendations
 
@@ -638,6 +852,11 @@ def get_detector_instance(model_path: Optional[str] = None) -> EnhancedLivenessD
     if _detector_instance is None:
         _detector_instance = EnhancedLivenessDetector(model_path)
     return _detector_instance
+
+def set_detection_sensitivity(mode: str):
+    """Set global detection sensitivity mode"""
+    detector = get_detector_instance()
+    detector.set_sensitivity(mode)
 
 def check_liveness_antispoof_mn3(image: np.ndarray, model_path: Optional[str] = None) -> float:
     """
