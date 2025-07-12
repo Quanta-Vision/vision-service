@@ -1,885 +1,1101 @@
-import numpy as np
 import cv2
-import os
-import onnxruntime
-import insightface
-from typing import Dict, List, Tuple, Optional
+import numpy as np
+from typing import Dict, Any, Optional, List
 import logging
-from dataclasses import dataclass
-from enum import Enum
-import time
-import threading
-from concurrent.futures import ThreadPoolExecutor
+from scipy import ndimage
+from skimage.feature import local_binary_pattern
+from skimage.measure import shannon_entropy
+import warnings
+warnings.filterwarnings('ignore')
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class LivenessMethod(Enum):
-    ONNX_MODEL = "onnx"
-    INSIGHTFACE = "insightface"
-    MULTI_FEATURE = "multi_feature"
-    ENSEMBLE = "ensemble"
-
-@dataclass
-class LivenessResult:
-    """Enhanced result structure for liveness detection"""
-    is_live: bool
-    confidence: float
-    method_used: str
-    detection_time: float
-    face_quality: float
-    spoof_indicators: Dict[str, float]
-    recommendations: List[str]
-
-class EnhancedLivenessDetector:
-    """Optimized liveness detection with configurable sensitivity"""
+class LivenessDetector:
+    """
+    Enhanced liveness detection system that combines multiple anti-spoofing techniques
+    to determine if an image is captured from a real camera or through screen/photo spoofing
+    """
     
-    def __init__(self, model_path: Optional[str] = None):
-        self.model_path = model_path
-        self._insightface_detector = None
-        self._onnx_session = None
-        self._antispoof_model = None
-        self._face_detector_lock = threading.Lock()
-        self._model_lock = threading.Lock()
+    def __init__(self):
+        self.version = "1.0.0"
+        self.default_threshold = 0.5
+        self.sensitivity = "medium"
+        self.detection_methods = [
+            "texture_analysis",
+            "frequency_analysis", 
+            "color_analysis",
+            "reflection_analysis",
+            "edge_analysis",
+            "noise_analysis",
+            "digital_artifacts_analysis",
+            "compression_analysis",
+            "lighting_analysis"
+        ]
         
-        # Configurable thresholds - can be adjusted based on your needs
-        self.liveness_threshold = 0.45
-        self._screen_penalty_multiplier = 0.6
-        self._natural_boost_multiplier = 1.15
-        self.face_quality_threshold = 0.25
-        self.min_face_size = 60
-        self.max_face_size = 1200
+        # Initialize face detector
+        try:
+            self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        except:
+            logger.warning("Face cascade not loaded, using full image analysis")
+            self.face_cascade = None
+    
+    def detect_liveness(self, image: np.ndarray, threshold: float = None) -> Dict[str, Any]:
+        """
+        Main liveness detection function
         
-        # Sensitivity settings - can be modified
-        self.sensitivity_mode = "lenient"  # "strict", "balanced", "lenient"
-        
-        # Initialize models
-        self._initialize_models()
-    
-    def set_sensitivity(self, mode: str):
-        """Set detection sensitivity mode"""
-        if mode == "strict":
-            self.liveness_threshold = 0.70
-            self._screen_penalty_multiplier = 1.0
-            self._natural_boost_multiplier = 1.0
-        elif mode == "balanced":
-            self.liveness_threshold = 0.58
-            self._screen_penalty_multiplier = 0.8
-            self._natural_boost_multiplier = 1.05
-        elif mode == "lenient":
-            self.liveness_threshold = 0.45
-            self._screen_penalty_multiplier = 0.6
-            self._natural_boost_multiplier = 1.15
-        
-        self.sensitivity_mode = mode
-        logger.info(f"Sensitivity mode set to: {mode}, threshold: {self.liveness_threshold}")
-    
-    def _initialize_models(self):
-        """Initialize all available models"""
+        Args:
+            image: Input image as numpy array
+            threshold: Detection threshold (0.0 to 1.0)
+            
+        Returns:
+            Dictionary with detection results
+        """
+        if threshold is None:
+            threshold = self.default_threshold
+            
         try:
-            # Initialize InsightFace detector
-            with self._face_detector_lock:
-                if self._insightface_detector is None:
-                    self._insightface_detector = insightface.app.FaceAnalysis(
-                        name="buffalo_l", 
-                        providers=['CPUExecutionProvider']
-                    )
-                    self._insightface_detector.prepare(ctx_id=0, det_size=(640, 640))
-                    logger.info("InsightFace detector initialized successfully")
-            
-            # Initialize ONNX model if available
-            if self.model_path and os.path.exists(self.model_path):
-                self._onnx_session = onnxruntime.InferenceSession(
-                    self.model_path, 
-                    providers=['CPUExecutionProvider']
-                )
-                logger.info(f"ONNX model loaded: {self.model_path}")
-            
-            # Try to initialize InsightFace antispoof model
-            self._try_load_antispoof_model()
-            
-            # Set default sensitivity
-            self.set_sensitivity("balanced")
-            
-        except Exception as e:
-            logger.error(f"Error initializing models: {e}")
-    
-    def _try_load_antispoof_model(self):
-        """Try to load InsightFace antispoof model"""
-        try:
-            possible_names = ["antispoof", "antifraud", "spoof", "liveness"]
-            
-            for name in possible_names:
-                try:
-                    model = insightface.model_zoo.get_model(name)
-                    if model is not None:
-                        model.prepare(ctx_id=0, input_size=(128, 128))
-                        self._antispoof_model = model
-                        logger.info(f"Antispoof model loaded: {name}")
-                        break
-                except Exception:
-                    continue
-                    
-        except Exception as e:
-            logger.warning(f"Could not load InsightFace antispoof model: {e}")
-    
-    def detect_and_analyze_face(self, image: np.ndarray) -> Optional[Dict]:
-        """Enhanced face detection with quality analysis"""
-        try:
-            with self._face_detector_lock:
-                faces = self._insightface_detector.get(image)
-                logger.info(f"Detected {len(faces)} faces")
-            
-            if not faces:
-                return None
-            
-            # Select the best face based on size and quality
-            best_face = None
-            best_score = 0
-            
-            for face in faces:
-                bbox = face.bbox
-                face_width = bbox[2] - bbox[0]
-                face_height = bbox[3] - bbox[1]
-                face_area = face_width * face_height
-                
-                # Check face size constraints
-                if face_width < self.min_face_size or face_height < self.min_face_size:
-                    continue
-                if face_width > self.max_face_size or face_height > self.max_face_size:
-                    logger.info(f"Skipping very large face: {face_width}x{face_height}")
-                    continue
-                
-                # Calculate face quality score
-                quality_score = self._calculate_face_quality(image, face)
-                
-                # Combined score considering area and quality
-                combined_score = (face_area / 10000) * quality_score
-                
-                if combined_score > best_score:
-                    best_score = combined_score
-                    best_face = face
-            
-            if best_face is None:
-                return None
-            
-            # Extract face region with padding
-            x1, y1, x2, y2 = map(int, best_face.bbox)
-            h, w = image.shape[:2]
-            
-            # Dynamic padding based on face size
-            padding = max(10, int(min(x2-x1, y2-y1) * 0.2))
-            x1 = max(0, x1 - padding)
-            y1 = max(0, y1 - padding)
-            x2 = min(w, x2 + padding)
-            y2 = min(h, y2 + padding)
-            
-            face_img = image[y1:y2, x1:x2]
-            
-            return {
-                'face_img': face_img,
-                'bbox': (x1, y1, x2, y2),
-                'quality': best_score,
-                'landmarks': getattr(best_face, 'landmark', None),
-                'age': getattr(best_face, 'age', None),
-                'gender': getattr(best_face, 'gender', None)
-            }
-            
-        except Exception as e:
-            logger.error(f"Error in face detection: {e}")
-            return None
-    
-    def _calculate_face_quality(self, image: np.ndarray, face) -> float:
-        """Calculate face quality score"""
-        try:
-            x1, y1, x2, y2 = map(int, face.bbox)
-            face_region = image[y1:y2, x1:x2]
-            
-            if face_region.size == 0:
-                return 0.0
+            # Validate input
+            if image is None or image.size == 0:
+                raise ValueError("Invalid input image")
             
             # Convert to grayscale for analysis
-            gray = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY)
-            
-            # 1. Sharpness (Laplacian variance)
-            laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-            sharpness_score = min(1.0, laplacian_var / 500.0)
-            
-            # 2. Brightness adequacy
-            mean_brightness = np.mean(gray)
-            brightness_score = 1.0 - abs(mean_brightness - 128) / 128.0
-            
-            # 3. Contrast
-            contrast = np.std(gray)
-            contrast_score = min(1.0, contrast / 50.0)
-            
-            # 4. Face size score
-            face_area = (x2 - x1) * (y2 - y1)
-            size_score = min(1.0, face_area / 40000.0)
-            
-            # Weighted combination
-            quality = (sharpness_score * 0.3 + brightness_score * 0.25 + 
-                      contrast_score * 0.25 + size_score * 0.2)
-            
-            return max(0.0, min(1.0, quality))
-            
-        except Exception as e:
-            logger.error(f"Error calculating face quality: {e}")
-            return 0.0
-    
-    def _advanced_spoof_detection(self, face_img: np.ndarray) -> Dict[str, float]:
-        """Advanced spoof detection with configurable sensitivity"""
-        try:
-            gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
-            indicators = {}
-            
-            # 1. Texture Analysis - adjusted for sensitivity
-            texture_scores = []
-            for scale in [3, 5, 7]:
-                kernel = np.ones((scale, scale), np.float32) / (scale * scale)
-                smooth = cv2.filter2D(gray, -1, kernel)
-                texture = cv2.absdiff(gray, smooth)
-                texture_scores.append(np.std(texture))
-            
-            avg_texture = np.mean(texture_scores)
-            # Adjust threshold based on sensitivity
-            texture_threshold = 22.0 if self.sensitivity_mode == "strict" else (20.0 if self.sensitivity_mode == "balanced" else 18.0)
-            indicators['texture_richness'] = min(1.0, avg_texture / texture_threshold)
-            
-            # 2. Screen Pattern Detection - configurable
-            f_transform = np.fft.fft2(gray)
-            f_shift = np.fft.fftshift(f_transform)
-            magnitude = np.log(np.abs(f_shift) + 1)
-            
-            h, w = magnitude.shape
-            center_y, center_x = h//2, w//2
-            
-            screen_pattern_score = 0
-            for radius in range(8, min(h, w)//4, 4):
-                ring_mask = np.zeros((h, w))
-                y, x = np.ogrid[:h, :w]
-                mask = ((x - center_x)**2 + (y - center_y)**2) >= radius**2
-                mask &= ((x - center_x)**2 + (y - center_y)**2) < (radius + 3)**2
-                ring_mask[mask] = 1
-                
-                ring_energy = np.sum(magnitude * ring_mask)
-                if ring_energy > screen_pattern_score:
-                    screen_pattern_score = ring_energy
-            
-            # Adjust threshold based on sensitivity
-            pattern_threshold = 5200.0 if self.sensitivity_mode == "strict" else (5500.0 if self.sensitivity_mode == "balanced" else 6000.0)
-            indicators['screen_pattern_absence'] = 1.0 - min(1.0, screen_pattern_score / pattern_threshold)
-            
-            # 3. RGB Channel Analysis - configurable
-            b, g, r = cv2.split(face_img)
-            
-            corr_rg = np.corrcoef(r.flatten(), g.flatten())[0, 1]
-            corr_rb = np.corrcoef(r.flatten(), b.flatten())[0, 1]
-            corr_gb = np.corrcoef(g.flatten(), b.flatten())[0, 1]
-            
-            correlations = [abs(c) for c in [corr_rg, corr_rb, corr_gb] if not np.isnan(c)]
-            avg_correlation = np.mean(correlations) if correlations else 0.8
-            
-            # Adjust sensitivity for RGB correlation
-            rgb_multiplier = 0.95 if self.sensitivity_mode == "strict" else (0.9 if self.sensitivity_mode == "balanced" else 0.85)
-            indicators['rgb_independence'] = 1.0 - min(1.0, avg_correlation * rgb_multiplier)
-            
-            # 4. Enhanced Color Analysis
-            hsv = cv2.cvtColor(face_img, cv2.COLOR_BGR2HSV)
-            lab = cv2.cvtColor(face_img, cv2.COLOR_BGR2LAB)
-            
-            skin_score = self._evaluate_skin_color_enhanced(face_img, hsv, lab)
-            indicators['skin_realism'] = skin_score
-            
-            h_entropy = self._calculate_entropy(hsv[:,:,0])
-            s_entropy = self._calculate_entropy(hsv[:,:,1])
-            v_entropy = self._calculate_entropy(hsv[:,:,2])
-            
-            # Adjust color diversity threshold
-            color_threshold = 13.5 if self.sensitivity_mode == "strict" else (13.0 if self.sensitivity_mode == "balanced" else 12.0)
-            indicators['color_diversity'] = min(1.0, (h_entropy + s_entropy + v_entropy) / color_threshold)
-            
-            # 5. Lighting Analysis
-            lighting_score = self._analyze_lighting_patterns_enhanced(gray)
-            indicators['natural_lighting'] = lighting_score
-            
-            # 6. Edge Analysis
-            edges_canny = cv2.Canny(gray, 30, 100)
-            edges_sobel = cv2.Sobel(gray, cv2.CV_8U, 1, 1, ksize=3)
-            
-            edge_density_canny = np.sum(edges_canny > 0) / (gray.shape[0] * gray.shape[1])
-            edge_density_sobel = np.sum(edges_sobel > 50) / (gray.shape[0] * gray.shape[1])
-            
-            edge_score = (edge_density_canny * 0.6 + edge_density_sobel * 0.4) * 12
-            indicators['edge_naturalness'] = min(1.0, edge_score)
-            
-            # 7. Moiré Detection - adjustable sensitivity
-            moire_score = self._detect_moire_enhanced(gray)
-            moire_multiplier = 0.9 if self.sensitivity_mode == "strict" else (0.8 if self.sensitivity_mode == "balanced" else 0.7)
-            indicators['moire_absence'] = 1.0 - (moire_score * moire_multiplier)
-            
-            # 8. Reflection Detection
-            reflection_score = self._detect_screen_reflections_enhanced(face_img)
-            indicators['reflection_absence'] = 1.0 - reflection_score
-            
-            # 9. Compression Artifacts
-            compression_score = self._detect_compression_artifacts(gray)
-            compression_multiplier = 0.8 if self.sensitivity_mode == "strict" else (0.7 if self.sensitivity_mode == "balanced" else 0.6)
-            indicators['compression_naturalness'] = 1.0 - (compression_score * compression_multiplier)
-            
-            # 10. Pixel Uniformity
-            uniformity_score = self._analyze_pixel_uniformity(gray)
-            indicators['pixel_naturalness'] = uniformity_score
-            
-            return indicators
-            
-        except Exception as e:
-            logger.error(f"Error in advanced spoof detection: {e}")
-            return {'error': 1.0}
-    
-    def _evaluate_skin_color_enhanced(self, face_img: np.ndarray, hsv: np.ndarray, lab: np.ndarray) -> float:
-        """Enhanced skin color evaluation with sensitivity adjustment"""
-        try:
-            h, s, v = cv2.split(hsv)
-            l, a, b = cv2.split(lab)
-            
-            # Adjust HSV ranges based on sensitivity
-            if self.sensitivity_mode == "lenient":
-                # More relaxed skin detection
-                skin_mask1 = cv2.inRange(hsv, (0, 20, 40), (30, 255, 255))
-                skin_mask2 = cv2.inRange(hsv, (150, 20, 40), (180, 255, 255))
-                lab_skin_mask = cv2.inRange(lab, (40, 110, 110), (220, 160, 160))
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             else:
-                # Standard skin detection
-                skin_mask1 = cv2.inRange(hsv, (0, 25, 50), (25, 255, 255))
-                skin_mask2 = cv2.inRange(hsv, (155, 25, 50), (180, 255, 255))
-                lab_skin_mask = cv2.inRange(lab, (45, 115, 115), (210, 155, 155))
+                gray = image.copy()
             
-            hsv_skin_mask = skin_mask1 | skin_mask2
-            hsv_skin_ratio = np.sum(hsv_skin_mask > 0) / (face_img.shape[0] * face_img.shape[1])
-            lab_skin_ratio = np.sum(lab_skin_mask > 0) / (face_img.shape[0] * face_img.shape[1])
-            
-            # RGB ratios
-            b_ch, g_ch, r_ch = cv2.split(face_img)
-            r_mean, g_mean, b_mean = np.mean(r_ch), np.mean(g_ch), np.mean(b_ch)
-            
-            # More lenient RGB scoring for lenient mode
-            if self.sensitivity_mode == "lenient":
-                rgb_order_score = 0.6  # Higher default
-                if r_mean > g_mean > b_mean:
-                    rgb_order_score = 1.0
-                elif r_mean > g_mean or g_mean > b_mean:
-                    rgb_order_score = 0.8
+            # Detect face region (optional)
+            face_region = self._detect_face_region(image)
+            if face_region is not None:
+                analysis_region = face_region
             else:
-                rgb_order_score = 0.4  # Standard default
-                if r_mean > g_mean > b_mean:
-                    rgb_order_score = 1.0
-                elif r_mean > g_mean or g_mean > b_mean:
-                    rgb_order_score = 0.7
+                analysis_region = gray
             
-            # Combine models
-            combined_score = (hsv_skin_ratio * 0.35 + lab_skin_ratio * 0.35 + rgb_order_score * 0.3)
+            # Perform multiple analyses
+            results = {}
             
-            # Adjust minimum score based on sensitivity
-            min_score = 0.1 if self.sensitivity_mode == "strict" else (0.15 if self.sensitivity_mode == "balanced" else 0.25)
-            return max(min_score, min(1.0, combined_score))
+            # 1. Texture Analysis (LBP - Local Binary Patterns)
+            results['texture'] = self._analyze_texture(analysis_region)
+            
+            # 2. Frequency Analysis (FFT)
+            results['frequency'] = self._analyze_frequency(analysis_region)
+            
+            # 3. Color Analysis
+            if len(image.shape) == 3:
+                results['color'] = self._analyze_color(image, face_region)
+            else:
+                results['color'] = {'score': 0.5, 'confidence': 0.0}
+            
+            # 4. Reflection Analysis
+            results['reflection'] = self._analyze_reflections(analysis_region)
+            
+            # 5. Edge Analysis
+            results['edge'] = self._analyze_edges(analysis_region)
+            
+            # 6. Noise Analysis
+            results['noise'] = self._analyze_noise(analysis_region)
+            
+            # 7. NEW: Digital Artifact Analysis
+            results['digital_artifacts'] = self._analyze_digital_artifacts(image)
+            
+            # 8. NEW: Compression Analysis
+            results['compression'] = self._analyze_compression_patterns(analysis_region)
+            
+            # 9. NEW: Lighting Analysis
+            results['lighting'] = self._analyze_lighting_patterns(analysis_region)
+            
+            # Combine all scores with updated weights
+            final_score, confidence = self._combine_scores(results)
+            
+            # Apply stricter decision logic
+            is_live = self._make_final_decision(results, final_score, threshold)
+            
+            # Determine spoof type if detected
+            spoof_type = None
+            if not is_live:
+                spoof_type = self._determine_spoof_type(results)
+            
+            return {
+                'is_live': is_live,
+                'confidence': confidence,
+                'liveness_score': final_score,
+                'decision_margin': abs(final_score - threshold),  # How far from threshold
+                'spoof_type': spoof_type,
+                'details': {
+                    'individual_scores': results,
+                    'final_score': final_score,
+                    'threshold_used': threshold,
+                    'decision_explanation': f"Final score ({final_score:.3f}) {'≥' if final_score >= threshold else '<'} threshold ({threshold:.3f}), Decision: {'LIVE' if is_live else 'SPOOF'}",
+                    'face_detected': face_region is not None,
+                    'image_quality': self._assess_image_quality(gray),
+                    'spoof_indicators': self._get_spoof_indicators(results)
+                }
+            }
             
         except Exception as e:
-            logger.error(f"Error in enhanced skin color evaluation: {e}")
-            return 0.5
+            logger.error(f"Error in liveness detection: {str(e)}")
+            return {
+                'is_live': False,
+                'confidence': 0.0,
+                'liveness_score': 0.0,
+                'decision_margin': 0.0,
+                'spoof_type': 'analysis_error',
+                'details': {'error': str(e)}
+            }
     
-    def _analyze_lighting_patterns_enhanced(self, gray: np.ndarray) -> float:
-        """Enhanced lighting pattern analysis"""
+    def _detect_face_region(self, image: np.ndarray) -> Optional[np.ndarray]:
+        """Detect face region in image"""
+        if self.face_cascade is None:
+            return None
+            
         try:
-            lighting_scores = []
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+            faces = self.face_cascade.detectMultiScale(gray, 1.1, 4)
             
-            for blur_size in [15, 31, 63]:
-                if blur_size < min(gray.shape):
-                    lighting_map = cv2.GaussianBlur(gray, (blur_size, blur_size), 0)
-                    
-                    grad_x = cv2.Sobel(lighting_map, cv2.CV_64F, 1, 0, ksize=3)
-                    grad_y = cv2.Sobel(lighting_map, cv2.CV_64F, 0, 1, ksize=3)
-                    grad_magnitude = np.sqrt(grad_x**2 + grad_y**2)
-                    
-                    grad_std = np.std(grad_magnitude)
-                    grad_mean = np.mean(grad_magnitude)
-                    
-                    if grad_mean > 0:
-                        multiplier = 1.5 if self.sensitivity_mode == "strict" else (1.3 if self.sensitivity_mode == "balanced" else 1.0)
-                        consistency = 1.0 - min(1.0, grad_std / (grad_mean * multiplier))
-                        min_consistency = 0.15 if self.sensitivity_mode == "strict" else (0.2 if self.sensitivity_mode == "balanced" else 0.3)
-                        lighting_scores.append(max(min_consistency, consistency))
+            if len(faces) > 0:
+                # Use the largest face
+                face = max(faces, key=lambda x: x[2] * x[3])
+                x, y, w, h = face
+                return gray[y:y+h, x:x+w]
+                
+        except Exception as e:
+            logger.warning(f"Face detection failed: {str(e)}")
             
-            default_score = 0.25 if self.sensitivity_mode == "strict" else (0.3 if self.sensitivity_mode == "balanced" else 0.4)
-            return max(default_score, np.mean(lighting_scores)) if lighting_scores else default_score
+        return None
+    
+    def _analyze_texture(self, image: np.ndarray) -> Dict[str, float]:
+        """Analyze texture using Local Binary Patterns"""
+        try:
+            # Calculate LBP
+            radius = 3
+            n_points = 8 * radius
+            lbp = local_binary_pattern(image, n_points, radius, method='uniform')
+            
+            # Calculate histogram
+            hist, _ = np.histogram(lbp.ravel(), bins=n_points + 2, range=(0, n_points + 2))
+            hist = hist.astype(float)
+            hist /= (hist.sum() + 1e-7)
+            
+            # Calculate texture measures
+            uniformity = np.sum(hist ** 2)
+            entropy = shannon_entropy(hist)
+            
+            # More discriminative texture scoring
+            # Real images: entropy typically 3.5-5.0, uniformity 0.05-0.15
+            # Screen images: entropy typically 3.0-4.5, uniformity 0.1-0.4
+            
+            # Combine entropy and uniformity for better discrimination
+            if entropy > 4.5 and uniformity < 0.15:
+                texture_score = 0.9  # High entropy, low uniformity = very textured (real)
+            elif entropy > 4.0 and uniformity < 0.2:
+                texture_score = 0.7  # Good texture
+            elif entropy > 3.5 and uniformity < 0.25:
+                texture_score = 0.5  # Moderate texture
+            elif entropy > 3.0 and uniformity < 0.35:
+                texture_score = 0.3  # Low texture (possibly screen)
+            else:
+                texture_score = 0.1  # Very low texture (likely screen)
+            
+            return {
+                'score': float(texture_score),
+                'uniformity': float(uniformity),
+                'entropy': float(entropy),
+                'confidence': float(min(abs(texture_score - 0.5) * 2, 1.0))
+            }
             
         except Exception as e:
-            logger.error(f"Error in enhanced lighting analysis: {e}")
-            return 0.4
+            logger.warning(f"Texture analysis failed: {str(e)}")
+            return {'score': 0.5, 'confidence': 0.0}
     
-    def _detect_moire_enhanced(self, gray: np.ndarray) -> float:
-        """Enhanced moiré pattern detection"""
+    def _analyze_frequency(self, image: np.ndarray) -> Dict[str, float]:
+        """Analyze frequency domain characteristics"""
         try:
-            kernel = np.array([[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]])
-            filtered = cv2.filter2D(gray, -1, kernel)
-            
-            f_transform = np.fft.fft2(filtered)
+            # Apply FFT
+            f_transform = np.fft.fft2(image)
             f_shift = np.fft.fftshift(f_transform)
-            magnitude = np.abs(f_shift)
+            magnitude_spectrum = np.log(np.abs(f_shift) + 1)
             
-            h, w = magnitude.shape
-            center_y, center_x = h//2, w//2
+            # Calculate frequency distribution
+            h, w = image.shape
+            center_h, center_w = h // 2, w // 2
             
-            max_periodic_energy = 0
+            # Create frequency bands
+            y, x = np.ogrid[:h, :w]
+            mask_low = (x - center_w)**2 + (y - center_h)**2 < (min(h, w) // 8)**2
+            mask_high = (x - center_w)**2 + (y - center_h)**2 > (min(h, w) // 4)**2
             
-            for radius in range(5, min(h, w)//3, 3):
-                angles = np.linspace(0, 2*np.pi, 16, endpoint=False)
-                energies = []
-                
-                for angle in angles:
-                    y = int(center_y + radius * np.sin(angle))
-                    x = int(center_x + radius * np.cos(angle))
-                    if 0 <= y < h and 0 <= x < w:
-                        energies.append(magnitude[y, x])
-                
-                if energies:
-                    energy_variance = np.var(energies)
-                    max_periodic_energy = max(max_periodic_energy, energy_variance)
+            low_freq_energy = np.sum(magnitude_spectrum[mask_low])
+            high_freq_energy = np.sum(magnitude_spectrum[mask_high])
             
-            # Adjust threshold based on sensitivity
-            moire_threshold = 2300.0 if self.sensitivity_mode == "strict" else (2500.0 if self.sensitivity_mode == "balanced" else 2800.0)
-            moire_score = min(1.0, max_periodic_energy / moire_threshold)
-            return moire_score
+            # Calculate ratio
+            freq_ratio = high_freq_energy / (low_freq_energy + 1e-7)
             
-        except Exception as e:
-            logger.error(f"Error in enhanced moiré detection: {e}")
-            return 0.0
-    
-    def _detect_screen_reflections_enhanced(self, face_img: np.ndarray) -> float:
-        """Enhanced screen reflection detection"""
-        try:
-            gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+            # More conservative scoring for frequency analysis
+            # Screen images typically have freq_ratio between 5-15
+            # Real images typically have freq_ratio > 8
+            if freq_ratio < 6:
+                freq_score = 0.2  # Very likely screen
+            elif freq_ratio < 8:
+                freq_score = 0.4  # Possibly screen
+            elif freq_ratio < 12:
+                freq_score = 0.6  # Borderline
+            elif freq_ratio < 16:
+                freq_score = 0.8  # Likely real
+            else:
+                freq_score = 0.9  # Very likely real
             
-            reflection_scores = []
-            
-            # Adjust percentiles based on sensitivity
-            percentiles = [90, 94, 97] if self.sensitivity_mode == "strict" else ([91, 95, 98] if self.sensitivity_mode == "balanced" else [92, 96, 99])
-            
-            for percentile in percentiles:
-                threshold = np.percentile(gray, percentile)
-                bright_mask = gray > threshold
-                
-                num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-                    bright_mask.astype(np.uint8), connectivity=8
-                )
-                
-                total_area = gray.shape[0] * gray.shape[1]
-                large_bright_area = 0
-                
-                area_threshold = 0.01 if self.sensitivity_mode == "strict" else (0.015 if self.sensitivity_mode == "balanced" else 0.02)
-                
-                for i in range(1, num_labels):
-                    area = stats[i, cv2.CC_STAT_AREA]
-                    if area > total_area * area_threshold:
-                        large_bright_area += area
-                
-                reflection_score = large_bright_area / total_area
-                reflection_scores.append(reflection_score)
-            
-            multiplier = 10.0 if self.sensitivity_mode == "strict" else (9.0 if self.sensitivity_mode == "balanced" else 8.0)
-            return min(1.0, np.mean(reflection_scores) * multiplier)
+            return {
+                'score': float(freq_score),
+                'freq_ratio': float(freq_ratio),
+                'low_freq_energy': float(low_freq_energy),
+                'high_freq_energy': float(high_freq_energy),
+                'confidence': float(min(abs(freq_score - 0.5) * 2, 1.0))
+            }
             
         except Exception as e:
-            logger.error(f"Error in enhanced reflection detection: {e}")
-            return 0.0
+            logger.warning(f"Frequency analysis failed: {str(e)}")
+            return {'score': 0.5, 'confidence': 0.0}
     
-    def _detect_compression_artifacts(self, gray: np.ndarray) -> float:
-        """Detect compression artifacts"""
+    def _analyze_color(self, image: np.ndarray, face_region: Optional[np.ndarray]) -> Dict[str, float]:
+        """Analyze color characteristics"""
         try:
-            block_size = 8
+            # Convert to different color spaces
+            hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+            lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+            
+            # Calculate color statistics
+            color_variance = np.var(image, axis=(0, 1))
+            color_mean = np.mean(image, axis=(0, 1))
+            
+            # Calculate color diversity
+            unique_colors = len(np.unique(image.reshape(-1, image.shape[-1]), axis=0))
+            total_pixels = image.shape[0] * image.shape[1]
+            color_diversity = unique_colors / total_pixels
+            
+            # Calculate saturation statistics
+            saturation = hsv[:, :, 1]
+            sat_mean = np.mean(saturation)
+            sat_std = np.std(saturation)
+            
+            # Live images typically have more natural color variation
+            # Screen images may have color shifts or reduced gamut
+            color_score = min(color_diversity * 10, 1.0)
+            
+            return {
+                'score': float(color_score),
+                'color_diversity': float(color_diversity),
+                'color_variance': [float(x) for x in color_variance],
+                'saturation_mean': float(sat_mean),
+                'saturation_std': float(sat_std),
+                'confidence': float(min(abs(color_score - 0.5) * 2, 1.0))
+            }
+            
+        except Exception as e:
+            logger.warning(f"Color analysis failed: {str(e)}")
+            return {'score': 0.5, 'confidence': 0.0}
+    
+    def _analyze_reflections(self, image: np.ndarray) -> Dict[str, float]:
+        """Analyze reflection patterns"""
+        try:
+            # Apply Gaussian blur to reduce noise
+            blurred = cv2.GaussianBlur(image, (5, 5), 0)
+            
+            # Find bright spots (potential reflections)
+            bright_threshold = np.percentile(blurred, 95)
+            bright_spots = blurred > bright_threshold
+            
+            # Calculate reflection characteristics
+            reflection_ratio = np.sum(bright_spots) / bright_spots.size
+            
+            # Group bright spots to find reflection patterns
+            labeled_spots, num_spots = ndimage.label(bright_spots)
+            
+            # Calculate spot sizes
+            spot_sizes = []
+            for i in range(1, num_spots + 1):
+                spot_size = np.sum(labeled_spots == i)
+                spot_sizes.append(spot_size)
+            
+            # Screen reflections often have different patterns than natural reflections
+            if len(spot_sizes) > 0:
+                avg_spot_size = np.mean(spot_sizes)
+                reflection_score = 1.0 - min(reflection_ratio * 5, 1.0)  # Fewer artificial reflections = more likely live
+            else:
+                reflection_score = 0.7  # No strong reflections detected
+            
+            return {
+                'score': float(reflection_score),
+                'reflection_ratio': float(reflection_ratio),
+                'num_spots': int(num_spots),
+                'avg_spot_size': float(avg_spot_size if spot_sizes else 0),
+                'confidence': float(min(abs(reflection_score - 0.5) * 2, 1.0))
+            }
+            
+        except Exception as e:
+            logger.warning(f"Reflection analysis failed: {str(e)}")
+            return {'score': 0.5, 'confidence': 0.0}
+    
+    def _analyze_edges(self, image: np.ndarray) -> Dict[str, float]:
+        """Analyze edge characteristics"""
+        try:
+            # Apply Canny edge detection
+            edges = cv2.Canny(image, 50, 150)
+            
+            # Calculate edge statistics
+            edge_density = np.sum(edges > 0) / edges.size
+            
+            # Calculate edge strength
+            sobel_x = cv2.Sobel(image, cv2.CV_64F, 1, 0, ksize=3)
+            sobel_y = cv2.Sobel(image, cv2.CV_64F, 0, 1, ksize=3)
+            edge_strength = np.sqrt(sobel_x**2 + sobel_y**2)
+            avg_edge_strength = np.mean(edge_strength)
+            
+            # Live images typically have sharper, more varied edges
+            # Screen images may have softer edges due to display characteristics
+            edge_score = min(avg_edge_strength / 100, 1.0)
+            
+            return {
+                'score': float(edge_score),
+                'edge_density': float(edge_density),
+                'avg_edge_strength': float(avg_edge_strength),
+                'confidence': float(min(abs(edge_score - 0.5) * 2, 1.0))
+            }
+            
+        except Exception as e:
+            logger.warning(f"Edge analysis failed: {str(e)}")
+            return {'score': 0.5, 'confidence': 0.0}
+    
+    def _analyze_noise(self, image: np.ndarray) -> Dict[str, float]:
+        """Analyze noise characteristics"""
+        try:
+            # Apply median filter to estimate noise
+            filtered = cv2.medianBlur(image, 5)
+            noise = image.astype(float) - filtered.astype(float)
+            
+            # Calculate noise statistics
+            noise_std = np.std(noise)
+            noise_mean = np.mean(np.abs(noise))
+            
+            # Calculate noise distribution
+            noise_hist, _ = np.histogram(noise.ravel(), bins=50, range=(-50, 50))
+            noise_hist = noise_hist.astype(float)
+            noise_hist /= (noise_hist.sum() + 1e-7)
+            
+            # Live images typically have more natural noise
+            # Screen images may have artificial noise patterns or reduced noise
+            noise_score = min(noise_std / 10, 1.0)
+            
+            return {
+                'score': float(noise_score),
+                'noise_std': float(noise_std),
+                'noise_mean': float(noise_mean),
+                'confidence': float(min(abs(noise_score - 0.5) * 2, 1.0))
+            }
+            
+        except Exception as e:
+            logger.warning(f"Noise analysis failed: {str(e)}")
+            return {'score': 0.5, 'confidence': 0.0}
+    
+    def _combine_scores(self, results: Dict[str, Dict[str, float]]) -> tuple:
+        """Combine individual analysis scores into final score"""
+        try:
+            # Updated weights with new detection methods
+            # More emphasis on digital artifact detection
+            weights = {
+                'texture': 0.15,           # Reduced weight
+                'frequency': 0.15,         # Reduced weight  
+                'color': 0.12,
+                'reflection': 0.10,
+                'edge': 0.10,
+                'noise': 0.08,
+                'digital_artifacts': 0.15,  # NEW: High weight for digital artifacts
+                'compression': 0.10,        # NEW: Compression analysis
+                'lighting': 0.05           # NEW: Lighting analysis
+            }
+            
+            weighted_score = 0.0
+            total_weight = 0.0
+            weighted_confidence = 0.0
+            method_count = 0
+            
+            for method, result in results.items():
+                if method in weights and 'score' in result:
+                    weight = weights[method]
+                    score = result['score']
+                    method_confidence = result.get('confidence', 0.5)
+                    
+                    weighted_score += weight * score
+                    weighted_confidence += weight * method_confidence
+                    total_weight += weight
+                    method_count += 1
+            
+            # Normalize
+            if total_weight > 0:
+                final_score = weighted_score / total_weight
+                base_confidence = weighted_confidence / total_weight
+                decision_confidence = abs(final_score - 0.5) * 2
+                overall_confidence = (base_confidence + decision_confidence) / 2
+                overall_confidence = min(overall_confidence, 1.0)
+            else:
+                final_score = 0.5
+                overall_confidence = 0.0
+            
+            return final_score, overall_confidence
+            
+        except Exception as e:
+            logger.warning(f"Score combination failed: {str(e)}")
+            return 0.5, 0.0
+    
+    def _determine_spoof_type(self, results: Dict[str, Dict[str, float]]) -> str:
+        """Determine the type of spoofing detected"""
+        try:
+            spoof_scores = {}
+            
+            # Analyze patterns to determine spoof type
+            for method, result in results.items():
+                score = result.get('score', 0.5)
+                spoof_scores[method] = score
+            
+            # Screen display indicators
+            screen_indicators = 0
+            if spoof_scores.get('frequency', 1.0) < 0.4:  # Low high-freq content
+                screen_indicators += 2
+            if spoof_scores.get('lighting', 1.0) < 0.3:  # Uniform backlighting
+                screen_indicators += 2
+            if spoof_scores.get('digital_artifacts', 1.0) < 0.4:  # Digital processing
+                screen_indicators += 1
+            if results.get('lighting', {}).get('backlight_intensity', 0) > 15:
+                screen_indicators += 2
+            
+            # Printed photo indicators
+            print_indicators = 0
+            if spoof_scores.get('texture', 1.0) < 0.3:  # Paper texture interference
+                print_indicators += 2
+            if spoof_scores.get('color', 1.0) < 0.3:  # Reduced color gamut
+                print_indicators += 2
+            if spoof_scores.get('reflection', 1.0) < 0.4:  # Paper reflections
+                print_indicators += 1
+            
+            # Digital manipulation indicators
+            digital_indicators = 0
+            if spoof_scores.get('digital_artifacts', 1.0) < 0.2:  # Heavy processing
+                digital_indicators += 3
+            if spoof_scores.get('compression', 1.0) < 0.3:  # Compression artifacts
+                digital_indicators += 2
+            if spoof_scores.get('edge', 1.0) < 0.3:  # Artificial edges
+                digital_indicators += 1
+            
+            # Determine most likely spoof type
+            max_indicators = max(screen_indicators, print_indicators, digital_indicators)
+            
+            if max_indicators >= 4:
+                if screen_indicators == max_indicators:
+                    return 'screen_display'
+                elif print_indicators == max_indicators:
+                    return 'printed_photo'
+                elif digital_indicators == max_indicators:
+                    return 'digital_manipulation'
+            
+            # Fallback logic for edge cases
+            if spoof_scores.get('frequency', 1.0) < 0.3:
+                return 'screen_display'
+            elif spoof_scores.get('color', 1.0) < 0.3 and spoof_scores.get('texture', 1.0) < 0.4:
+                return 'printed_photo'
+            elif spoof_scores.get('digital_artifacts', 1.0) < 0.3:
+                return 'digital_manipulation'
+            else:
+                return 'unknown_spoof'
+                
+        except Exception as e:
+            logger.warning(f"Spoof type determination failed: {str(e)}")
+            return 'unknown_spoof'
+    
+    def _assess_image_quality(self, image: np.ndarray) -> Dict[str, float]:
+        """Assess overall image quality"""
+        try:
+            # Calculate sharpness (variance of Laplacian)
+            laplacian = cv2.Laplacian(image, cv2.CV_64F)
+            sharpness = np.var(laplacian)
+            
+            # Calculate brightness
+            brightness = np.mean(image)
+            
+            # Calculate contrast
+            contrast = np.std(image)
+            
+            return {
+                'sharpness': float(sharpness),
+                'brightness': float(brightness),
+                'contrast': float(contrast),
+                'overall_quality': float(min((sharpness / 1000 + contrast / 100) / 2, 1.0))
+            }
+        
+        except Exception as e:
+            logger.warning(f"Image quality assessment failed: {str(e)}")
+            return {'overall_quality': 0.5}
+            
+    def _analyze_digital_artifacts(self, image: np.ndarray) -> Dict[str, float]:
+        """Analyze for digital processing artifacts"""
+        try:
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = image.copy()
+            
+            # 1. Check for JPEG compression artifacts
+            # Look for 8x8 block patterns common in JPEG
             h, w = gray.shape
+            block_differences = []
             
-            artifact_scores = []
+            for y in range(0, h-8, 8):
+                for x in range(0, w-8, 8):
+                    block = gray[y:y+8, x:x+8]
+                    # Check uniformity within block vs across block boundaries
+                    if y+16 < h and x+16 < w:
+                        next_block = gray[y+8:y+16, x+8:x+16]
+                        boundary_diff = np.mean(np.abs(block.astype(float) - next_block.astype(float)))
+                        block_differences.append(boundary_diff)
             
+            # 2. Check for digital sharpening artifacts
+            # Oversharpened images have characteristic edge halos
+            kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+            sharpened = cv2.filter2D(gray, -1, kernel)
+            sharpening_artifacts = np.mean(np.abs(sharpened.astype(float) - gray.astype(float)))
+            
+            # 3. Check for unnatural uniformity (digital smoothing)
+            # Calculate local variance across the image
+            kernel_size = 5
+            local_variances = []
+            for y in range(0, h-kernel_size, kernel_size):
+                for x in range(0, w-kernel_size, kernel_size):
+                    patch = gray[y:y+kernel_size, x:x+kernel_size]
+                    local_variances.append(np.var(patch))
+            
+            variance_uniformity = np.std(local_variances) if local_variances else 0
+            
+            # Combine indicators
+            if block_differences:
+                avg_block_diff = np.mean(block_differences)
+                # High block differences suggest compression artifacts
+                compression_score = min(avg_block_diff / 20, 1.0)
+            else:
+                compression_score = 0.5
+            
+            # Lower sharpening artifacts = more natural
+            sharpening_score = max(0, 1.0 - min(sharpening_artifacts / 50, 1.0))
+            
+            # Higher variance uniformity = less digital processing
+            uniformity_score = min(variance_uniformity / 100, 1.0)
+            
+            # Combine scores (lower = more digital artifacts = more likely spoof)
+            digital_score = (sharpening_score + uniformity_score) / 2
+            digital_score = max(0, min(digital_score, 1.0))
+            
+            return {
+                'score': float(digital_score),
+                'compression_artifacts': float(compression_score),
+                'sharpening_artifacts': float(sharpening_artifacts),
+                'variance_uniformity': float(variance_uniformity),
+                'confidence': float(abs(digital_score - 0.5) * 2)
+            }
+            
+        except Exception as e:
+            logger.warning(f"Digital artifact analysis failed: {str(e)}")
+            return {'score': 0.5, 'confidence': 0.0}
+    
+    def _analyze_compression_patterns(self, image: np.ndarray) -> Dict[str, float]:
+        """Analyze compression patterns that indicate digital processing"""
+        try:
+            # Apply DCT analysis to detect compression patterns
+            # Real camera images have different compression characteristics than processed images
+            
+            # Convert to float
+            img_float = image.astype(np.float32)
+            
+            # Apply 2D DCT on 8x8 blocks
+            h, w = img_float.shape
+            dct_coeffs = []
+            
+            for y in range(0, h-8, 8):
+                for x in range(0, w-8, 8):
+                    block = img_float[y:y+8, x:x+8]
+                    dct_block = cv2.dct(block)
+                    # Focus on high-frequency coefficients
+                    high_freq = dct_block[4:, 4:]
+                    dct_coeffs.extend(high_freq.flatten())
+            
+            if dct_coeffs:
+                # Calculate statistics of DCT coefficients
+                dct_mean = np.mean(np.abs(dct_coeffs))
+                dct_std = np.std(dct_coeffs)
+                
+                # Real images typically have more varied DCT coefficients
+                # Heavily compressed images have more uniform/quantized coefficients
+                compression_score = min(dct_std / 10, 1.0)
+            else:
+                compression_score = 0.5
+            
+            return {
+                'score': float(compression_score),
+                'dct_mean': float(dct_mean if dct_coeffs else 0),
+                'dct_std': float(dct_std if dct_coeffs else 0),
+                'confidence': float(abs(compression_score - 0.5) * 2)
+            }
+            
+        except Exception as e:
+            logger.warning(f"Compression pattern analysis failed: {str(e)}")
+            return {'score': 0.5, 'confidence': 0.0}
+    
+    def _analyze_lighting_patterns(self, image: np.ndarray) -> Dict[str, float]:
+        """Analyze lighting patterns for naturalness"""
+        try:
+            # Real photos have natural lighting variations
+            # Screen photos often have artificial, uniform lighting
+            
+            # Calculate gradient magnitude to detect lighting transitions
+            grad_x = cv2.Sobel(image, cv2.CV_64F, 1, 0, ksize=3)
+            grad_y = cv2.Sobel(image, cv2.CV_64F, 0, 1, ksize=3)
+            gradient_mag = np.sqrt(grad_x**2 + grad_y**2)
+            
+            # Analyze lighting uniformity
+            # Divide image into regions and check lighting consistency
+            h, w = image.shape
+            region_size = min(h, w) // 4
+            region_means = []
+            
+            for y in range(0, h-region_size, region_size):
+                for x in range(0, w-region_size, region_size):
+                    region = image[y:y+region_size, x:x+region_size]
+                    region_means.append(np.mean(region))
+            
+            if region_means:
+                lighting_variance = np.var(region_means)
+                lighting_std = np.std(region_means)
+                
+                # Natural images have more lighting variation
+                # Screen images often have uniform backlighting
+                lighting_score = min(lighting_variance / 500, 1.0)
+            else:
+                lighting_score = 0.5
+            
+            # Check for screen backlight patterns
+            # Screens often have subtle grid patterns from backlighting
+            blur_kernel = 15
+            blurred = cv2.GaussianBlur(image, (blur_kernel, blur_kernel), 0)
+            backlight_pattern = np.abs(image.astype(float) - blurred.astype(float))
+            backlight_intensity = np.mean(backlight_pattern)
+            
+            # Lower backlight intensity = more natural
+            backlight_score = max(0, 1.0 - min(backlight_intensity / 20, 1.0))
+            
+            # Combine scores
+            final_lighting_score = (lighting_score + backlight_score) / 2
+            
+            return {
+                'score': float(final_lighting_score),
+                'lighting_variance': float(lighting_variance if region_means else 0),
+                'backlight_intensity': float(backlight_intensity),
+                'gradient_mean': float(np.mean(gradient_mag)),
+                'confidence': float(abs(final_lighting_score - 0.5) * 2)
+            }
+            
+        except Exception as e:
+            logger.warning(f"Lighting pattern analysis failed: {str(e)}")
+            return {'score': 0.5, 'confidence': 0.0}
+    
+    def _make_final_decision(self, results: Dict, final_score: float, threshold: float) -> bool:
+        """Make final decision with additional checks"""
+        try:
+            # Start with score-based decision
+            basic_decision = final_score >= threshold
+            
+            # Count red flags instead of immediate rejection
+            red_flags = 0
+            red_flag_details = []
+            
+            # Rule 1: Low compression score (but not immediate rejection)
+            compression_score = results.get('compression', {}).get('score', 0.5)
+            if compression_score < 0.08:  # Very low = red flag
+                red_flags += 1
+                red_flag_details.append(f"Very low compression: {compression_score:.3f}")
+            
+            # Rule 2: Count low scores
+            if results.get('color', {}).get('score', 0.5) < 0.25:  # More strict threshold
+                red_flags += 1
+                red_flag_details.append(f"Low color: {results.get('color', {}).get('score', 0.5):.3f}")
+            if results.get('edge', {}).get('score', 0.5) < 0.20:   # More strict threshold  
+                red_flags += 1
+                red_flag_details.append(f"Low edge: {results.get('edge', {}).get('score', 0.5):.3f}")
+            if results.get('noise', {}).get('score', 0.5) < 0.25:  # More strict threshold
+                red_flags += 1
+                red_flag_details.append(f"Low noise: {results.get('noise', {}).get('score', 0.5):.3f}")
+                
+            # Rule 3: Perfect texture and frequency scores are suspicious
+            texture_score = results.get('texture', {}).get('score', 0.5)
+            frequency_score = results.get('frequency', {}).get('score', 0.5)
+            
+            if texture_score >= 0.99 and frequency_score >= 0.99:
+                red_flags += 1
+                red_flag_details.append(f"Perfect scores: texture={texture_score:.3f}, freq={frequency_score:.3f}")
+            
+            # Rule 4: Check digital artifacts
+            digital_score = results.get('digital_artifacts', {}).get('score', 0.5)
+            if digital_score < 0.3:
+                red_flags += 1
+                red_flag_details.append(f"Low digital artifacts: {digital_score:.3f}")
+            
+            # Rule 5: Check lighting
+            lighting_score = results.get('lighting', {}).get('score', 0.5)
+            if lighting_score < 0.3:
+                red_flags += 1
+                red_flag_details.append(f"Low lighting: {lighting_score:.3f}")
+            
+            # Final decision based on red flags and basic score
+            if red_flags >= 4:  # Many red flags = definitely spoof
+                return False
+            elif red_flags >= 3 and final_score < 0.6:  # Some red flags + low score = spoof
+                return False
+            elif red_flags >= 2 and final_score < 0.4:  # Few red flags but very low score = spoof
+                return False
+            else:
+                return basic_decision  # Trust the weighted score
+            
+        except Exception as e:
+            logger.warning(f"Final decision logic failed: {str(e)}")
+            return final_score >= threshold
+        
+    def _get_spoof_indicators(self, results: Dict) -> List[str]:
+        """Get list of detected spoof indicators"""
+        indicators = []
+        
+        try:
+            for method, result in results.items():
+                score = result.get('score', 0.5)
+                if score < 0.3:
+                    method_name = method.replace('_', ' ').title()
+                    indicators.append(f"Low {method_name} Score ({score:.2f})")
+            
+            # Add specific indicators
+            if results.get('digital_artifacts', {}).get('compression_artifacts', 0) > 0.7:
+                indicators.append("High compression artifacts detected")
+            
+            if results.get('lighting', {}).get('backlight_intensity', 0) > 15:
+                indicators.append("Screen backlight pattern detected")
+            
+            if results.get('frequency', {}).get('freq_ratio', 0) < 0.5:
+                indicators.append("Reduced high-frequency content (screen characteristic)")
+            
+        except Exception as e:
+            logger.warning(f"Spoof indicator detection failed: {str(e)}")
+        
+        return indicators
+    
+    def get_version(self) -> str:
+        """Get detector version"""
+        return self.version
+    
+    def get_detection_methods(self) -> List[str]:
+        """Get list of detection methods"""
+        return self.detection_methods.copy()
+    
+    def set_threshold(self, threshold: float):
+        """Set default detection threshold"""
+        if 0.0 <= threshold <= 1.0:
+            self.default_threshold = threshold
+        else:
+            raise ValueError("Threshold must be between 0.0 and 1.0")
+    
+    def set_sensitivity(self, sensitivity: str):
+        """Set detection sensitivity"""
+        if sensitivity in ['low', 'medium', 'high']:
+            self.sensitivity = sensitivity
+            # Adjust detection parameters based on sensitivity
+            if sensitivity == 'low':
+                self.default_threshold = 0.3
+            elif sensitivity == 'medium':
+                self.default_threshold = 0.5
+            elif sensitivity == 'high':
+                self.default_threshold = 0.7
+        else:
+            raise ValueError("Sensitivity must be 'low', 'medium', or 'high'")
+    
+    def get_config(self) -> Dict[str, Any]:
+        """Get current detector configuration"""
+        return {
+            'version': self.version,
+            'default_threshold': self.default_threshold,
+            'sensitivity': self.sensitivity,
+            'detection_methods': self.detection_methods,
+            'face_detection_enabled': self.face_cascade is not None
+        }
+    
+    def detect_multiple_faces(self, image: np.ndarray, threshold: float = None) -> List[Dict[str, Any]]:
+        """
+        Detect liveness for multiple faces in an image
+        
+        Args:
+            image: Input image as numpy array
+            threshold: Detection threshold (0.0 to 1.0)
+            
+        Returns:
+            List of detection results for each face
+        """
+        if threshold is None:
+            threshold = self.default_threshold
+            
+        try:
+            results = []
+            
+            if self.face_cascade is None:
+                # No face detection available, analyze whole image
+                result = self.detect_liveness(image, threshold)
+                result['face_id'] = 0
+                result['bbox'] = None
+                return [result]
+            
+            # Detect all faces
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+            faces = self.face_cascade.detectMultiScale(gray, 1.1, 4)
+            
+            if len(faces) == 0:
+                # No faces detected, analyze whole image
+                result = self.detect_liveness(image, threshold)
+                result['face_id'] = 0
+                result['bbox'] = None
+                return [result]
+            
+            # Analyze each face
+            for i, (x, y, w, h) in enumerate(faces):
+                face_region = image[y:y+h, x:x+w]
+                result = self.detect_liveness(face_region, threshold)
+                result['face_id'] = i
+                result['bbox'] = {'x': int(x), 'y': int(y), 'width': int(w), 'height': int(h)}
+                results.append(result)
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Multiple face detection failed: {str(e)}")
+            return [{
+                'is_live': False,
+                'confidence': 0.0,
+                'liveness_score': 0.0,
+                'spoof_type': 'analysis_error',
+                'face_id': 0,
+                'bbox': None,
+                'details': {'error': str(e)}
+            }]
+    
+    def analyze_video_frame(self, frame: np.ndarray, frame_number: int, threshold: float = None) -> Dict[str, Any]:
+        """
+        Analyze a single video frame for liveness
+        
+        Args:
+            frame: Video frame as numpy array
+            frame_number: Frame number in sequence
+            threshold: Detection threshold (0.0 to 1.0)
+            
+        Returns:
+            Dictionary with detection results including temporal information
+        """
+        if threshold is None:
+            threshold = self.default_threshold
+            
+        try:
+            # Standard liveness detection
+            result = self.detect_liveness(frame, threshold)
+            
+            # Add frame-specific information
+            result['frame_number'] = frame_number
+            result['frame_quality'] = self._assess_frame_quality(frame)
+            
+            # Additional video-specific analysis
+            result['motion_blur'] = self._detect_motion_blur(frame)
+            result['compression_artifacts'] = self._detect_compression_artifacts(frame)
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Video frame analysis failed: {str(e)}")
+            return {
+                'is_live': False,
+                'confidence': 0.0,
+                'liveness_score': 0.0,
+                'spoof_type': 'analysis_error',
+                'frame_number': frame_number,
+                'details': {'error': str(e)}
+            }
+    
+    def _assess_frame_quality(self, frame: np.ndarray) -> Dict[str, float]:
+        """Assess video frame quality"""
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+            
+            # Calculate frame quality metrics
+            quality_metrics = self._assess_image_quality(gray)
+            
+            # Additional video-specific metrics
+            # Check for interlacing artifacts
+            interlace_score = self._detect_interlacing(gray)
+            quality_metrics['interlacing'] = interlace_score
+            
+            return quality_metrics
+            
+        except Exception as e:
+            logger.warning(f"Frame quality assessment failed: {str(e)}")
+            return {'overall_quality': 0.5}
+    
+    def _detect_motion_blur(self, frame: np.ndarray) -> Dict[str, float]:
+        """Detect motion blur in frame"""
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+            
+            # Calculate variance of Laplacian (blur detection)
+            laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+            blur_score = np.var(laplacian)
+            
+            # Lower values indicate more blur
+            is_blurred = blur_score < 100
+            
+            return {
+                'blur_score': blur_score,
+                'is_blurred': is_blurred,
+                'blur_confidence': min(abs(blur_score - 100) / 100, 1.0)
+            }
+            
+        except Exception as e:
+            logger.warning(f"Motion blur detection failed: {str(e)}")
+            return {'blur_score': 0.0, 'is_blurred': False, 'blur_confidence': 0.0}
+    
+    def _detect_compression_artifacts(self, frame: np.ndarray) -> Dict[str, float]:
+        """Detect compression artifacts in frame"""
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+            
+            # Look for block artifacts (8x8 DCT blocks)
+            h, w = gray.shape
+            block_size = 8
+            
+            # Calculate block variance
+            block_variances = []
             for y in range(0, h - block_size, block_size):
                 for x in range(0, w - block_size, block_size):
-                    block = gray[y:y+block_size, x:x+block_size].astype(np.float32)
-                    
-                    dct = cv2.dct(block)
-                    high_freq = dct[4:, 4:]
-                    high_freq_energy = np.sum(high_freq**2)
-                    artifact_scores.append(high_freq_energy)
+                    block = gray[y:y+block_size, x:x+block_size]
+                    block_variances.append(np.var(block))
             
-            if artifact_scores:
-                avg_energy = np.mean(artifact_scores)
-                # Adjust threshold based on sensitivity
-                energy_threshold = 1100.0 if self.sensitivity_mode == "strict" else (1200.0 if self.sensitivity_mode == "balanced" else 1400.0)
-                compression_score = 1.0 - min(1.0, avg_energy / energy_threshold)
-                return compression_score
+            if block_variances:
+                avg_block_variance = np.mean(block_variances)
+                compression_score = min(avg_block_variance / 1000, 1.0)
+            else:
+                compression_score = 0.5
             
-            return 0.0
-            
-        except Exception as e:
-            logger.error(f"Error detecting compression artifacts: {e}")
-            return 0.0
-    
-    def _analyze_pixel_uniformity(self, gray: np.ndarray) -> float:
-        """Analyze pixel uniformity"""
-        try:
-            kernel = np.ones((3, 3), np.float32) / 9
-            smooth = cv2.filter2D(gray, -1, kernel)
-            variation = cv2.absdiff(gray, smooth)
-            
-            variation_std = np.std(variation)
-            
-            grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-            grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-            grad_magnitude = np.sqrt(grad_x**2 + grad_y**2)
-            
-            grad_entropy = self._calculate_entropy(grad_magnitude.astype(np.uint8))
-            
-            # Adjust thresholds based on sensitivity
-            var_divisor = 8.5 if self.sensitivity_mode == "strict" else (9.0 if self.sensitivity_mode == "balanced" else 9.5)
-            entropy_divisor = 6.5 if self.sensitivity_mode == "strict" else (7.0 if self.sensitivity_mode == "balanced" else 7.5)
-            
-            uniformity_score = min(1.0, (variation_std / var_divisor + grad_entropy / entropy_divisor) / 2.0)
-            
-            min_score = 0.15 if self.sensitivity_mode == "strict" else (0.2 if self.sensitivity_mode == "balanced" else 0.3)
-            return max(min_score, uniformity_score)
-            
-        except Exception as e:
-            logger.error(f"Error analyzing pixel uniformity: {e}")
-            return 0.4
-    
-    def _calculate_entropy(self, image: np.ndarray) -> float:
-        """Calculate image entropy"""
-        try:
-            hist = cv2.calcHist([image], [0], None, [256], [0, 256])
-            hist = hist.flatten()
-            hist = hist[hist > 0]
-            hist = hist / hist.sum()
-            entropy = -np.sum(hist * np.log2(hist))
-            return entropy
-        except Exception:
-            return 0.0
-    
-    def _optimized_ensemble_scoring(self, indicators: Dict[str, float]) -> float:
-        """Optimized ensemble scoring with configurable sensitivity"""
-        try:
-            # Check for strong screen indicators
-            moire_score = indicators.get('moire_absence', 1.0)
-            rgb_score = indicators.get('rgb_independence', 1.0)
-            screen_pattern_score = indicators.get('screen_pattern_absence', 1.0)
-            
-            # Adjust thresholds based on sensitivity mode
-            if self.sensitivity_mode == "strict":
-                moire_threshold, rgb_threshold, pattern_threshold = 0.5, 0.5, 0.7
-            elif self.sensitivity_mode == "balanced":
-                moire_threshold, rgb_threshold, pattern_threshold = 0.4, 0.4, 0.6
-            else:  # lenient
-                moire_threshold, rgb_threshold, pattern_threshold = 0.3, 0.3, 0.5
-            
-            # Count strong negative indicators
-            strong_screen_indicators = 0
-            if moire_score < moire_threshold:
-                strong_screen_indicators += 1
-            if rgb_score < rgb_threshold:
-                strong_screen_indicators += 1
-            if screen_pattern_score < pattern_threshold:
-                strong_screen_indicators += 1
-            
-            # Balanced weights
-            weights = {
-                'texture_richness': 0.13,
-                'screen_pattern_absence': 0.14,
-                'rgb_independence': 0.12,
-                'skin_realism': 0.11,
-                'color_diversity': 0.09,
-                'natural_lighting': 0.11,
-                'edge_naturalness': 0.09,
-                'moire_absence': 0.12,
-                'reflection_absence': 0.08,
-                'compression_naturalness': 0.06,
-                'pixel_naturalness': 0.10
+            return {
+                'compression_score': compression_score,
+                'has_artifacts': compression_score < 0.3,
+                'avg_block_variance': avg_block_variance if block_variances else 0.0
             }
-
-            total_score = 0.0
-            total_weight = 0.0
-
-            for indicator, value in indicators.items():
-                if indicator in weights and not np.isnan(value):
-                    total_score += value * weights[indicator]
-                    total_weight += weights[indicator]
-
-            base_score = total_score / total_weight if total_weight > 0 else 0.5
-            
-            # Apply penalties based on sensitivity and screen indicators
-            final_score = base_score
-            
-            # Make penalty less harsh (tune as needed)
-            if strong_screen_indicators >= 2:
-                penalty = 0.85 if self.sensitivity_mode == "strict" else (0.88 if self.sensitivity_mode == "balanced" else 0.9)
-                final_score *= penalty
-                logger.info(f"Multiple screen indicators detected: {strong_screen_indicators}")
-            elif strong_screen_indicators == 1:
-                penalty = 0.92 if self.sensitivity_mode == "strict" else (0.95 if self.sensitivity_mode == "balanced" else 0.97)
-                final_score *= penalty
-                logger.info(f"One screen indicator detected: {strong_screen_indicators}")
-            
-            # Boost score if face_quality or skin_realism is high, to help real images
-            skin_realism = indicators.get('skin_realism', 0)
-            if skin_realism > 0.8:
-                final_score = min(1.0, final_score + 0.15)
-                
-            # Bonus: if texture_richness and edge_naturalness are both high, add a bit more
-            if indicators.get('texture_richness', 0) > 0.6 and indicators.get('edge_naturalness', 0) > 0.8:
-                final_score = min(1.0, final_score + 0.05)
-
-            # Apply boost for natural characteristics based on sensitivity
-            skin_realism = indicators.get('skin_realism', 0)
-            natural_lighting = indicators.get('natural_lighting', 0)
-            
-            if skin_realism > 0.7 and natural_lighting > 0.5 and strong_screen_indicators == 0:
-                boost = getattr(self, '_natural_boost_multiplier', 1.05)
-                final_score *= boost
-            
-            logger.info("--- Optimized Spoof Indicators ---")
-            for k, v in indicators.items():
-                logger.info(f"{k:25}: {v:.3f}")
-            logger.info(f"Sensitivity: {self.sensitivity_mode}, Base: {base_score:.3f}, Screen indicators: {strong_screen_indicators}, Final: {final_score:.3f}")
-
-            return max(0.0, min(1.0, final_score))
-
-        except Exception as e:
-            logger.error(f"Error in optimized ensemble scoring: {e}")
-            return 0.5
-
-    def check_liveness(self, image: np.ndarray, method: LivenessMethod = LivenessMethod.ENSEMBLE) -> LivenessResult:
-        """Main liveness detection function with optimized scoring"""
-        start_time = time.time()
-        
-        try:
-            # Detect and analyze face
-            face_data = self.detect_and_analyze_face(image)
-            if face_data is None:
-                return LivenessResult(
-                    is_live=False,
-                    confidence=0.0,
-                    method_used="face_detection_failed",
-                    detection_time=time.time() - start_time,
-                    face_quality=0.0,
-                    spoof_indicators={},
-                    recommendations=["No face detected", "Ensure face is clearly visible", "Improve lighting"]
-                )
-            
-            face_img = face_data['face_img']
-            face_quality = face_data['quality']
-            
-            # Check face quality
-            if face_quality < self.face_quality_threshold:
-                return LivenessResult(
-                    is_live=False,
-                    confidence=0.0,
-                    method_used="low_quality",
-                    detection_time=time.time() - start_time,
-                    face_quality=face_quality,
-                    spoof_indicators={},
-                    recommendations=["Face quality too low", "Move closer to camera", "Improve lighting"]
-                )
-            
-            # Resize face for processing
-            face_resized = cv2.resize(face_img, (128, 128))
-            
-            # Initialize results
-            confidence = 0.0
-            method_used = method.value
-            spoof_indicators = {}
-            recommendations = []
-            
-            # Method selection and execution
-            if method == LivenessMethod.ONNX_MODEL and self._onnx_session:
-                confidence = self._onnx_liveness_check(face_resized)
-                method_used = "onnx_model"
-                
-            elif method == LivenessMethod.INSIGHTFACE and self._antispoof_model:
-                confidence = self._insightface_liveness_check(face_resized)
-                method_used = "insightface_model"
-                
-            elif method == LivenessMethod.MULTI_FEATURE or method == LivenessMethod.ENSEMBLE:
-                # Optimized multi-feature analysis
-                spoof_indicators = self._advanced_spoof_detection(face_resized)
-                confidence = self._optimized_ensemble_scoring(spoof_indicators)
-                method_used = f"optimized_ensemble_v5_{self.sensitivity_mode}"
-                
-            else:
-                # Fallback to optimized analysis
-                spoof_indicators = self._advanced_spoof_detection(face_resized)
-                confidence = self._optimized_ensemble_scoring(spoof_indicators)
-                method_used = f"optimized_fallback_{self.sensitivity_mode}"
-            
-            # Generate recommendations
-            recommendations = self._generate_recommendations(confidence, spoof_indicators, face_quality)
-            
-            # Final decision
-            is_live = confidence > self.liveness_threshold
-            detection_time = time.time() - start_time
-            
-            return LivenessResult(
-                is_live=is_live,
-                confidence=confidence,
-                method_used=method_used,
-                detection_time=detection_time,
-                face_quality=face_quality,
-                spoof_indicators=spoof_indicators,
-                recommendations=recommendations
-            )
             
         except Exception as e:
-            logger.error(f"Error in liveness detection: {e}")
-            return LivenessResult(
-                is_live=False,
-                confidence=0.0,
-                method_used="error",
-                detection_time=time.time() - start_time,
-                face_quality=0.0,
-                spoof_indicators={},
-                recommendations=["Detection failed", "Please try again"]
-            )
+            logger.warning(f"Compression artifact detection failed: {str(e)}")
+            return {'compression_score': 0.5, 'has_artifacts': False}
     
-    def _onnx_liveness_check(self, face_img: np.ndarray) -> float:
-        """ONNX model liveness check"""
+    def _detect_interlacing(self, gray: np.ndarray) -> float:
+        """Detect interlacing artifacts"""
         try:
-            img_rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
-            img_norm = img_rgb.astype(np.float32) / 255.0
-            img_norm = img_norm.transpose(2, 0, 1)[None]
+            # Check for interlacing by comparing odd and even rows
+            odd_rows = gray[1::2, :]
+            even_rows = gray[::2, :]
             
-            input_name = self._onnx_session.get_inputs()[0].name
-            output = self._onnx_session.run(None, {input_name: img_norm})[0]
-            score = float(output[0][0])
+            # Resize to same dimensions
+            min_rows = min(odd_rows.shape[0], even_rows.shape[0])
+            odd_rows = odd_rows[:min_rows, :]
+            even_rows = even_rows[:min_rows, :]
             
-            return max(0.0, min(1.0, score))
+            # Calculate difference
+            diff = np.abs(odd_rows.astype(float) - even_rows.astype(float))
+            interlace_score = np.mean(diff)
+            
+            return min(interlace_score / 50, 1.0)
             
         except Exception as e:
-            logger.error(f"Error in ONNX liveness check: {e}")
+            logger.warning(f"Interlacing detection failed: {str(e)}")
             return 0.0
     
-    def _insightface_liveness_check(self, face_img: np.ndarray) -> float:
-        """InsightFace model liveness check"""
+    def get_supported_formats(self) -> List[str]:
+        """Get list of supported image formats"""
+        return ['JPG', 'JPEG', 'PNG', 'BMP', 'TIFF', 'WEBP']
+    
+    def validate_image_format(self, image: np.ndarray) -> bool:
+        """Validate if image format is supported"""
         try:
-            face_rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
-            score = self._antispoof_model.detect_liveness(face_rgb)
-            return max(0.0, min(1.0, float(score)))
+            if image is None or image.size == 0:
+                return False
+            
+            # Check dimensions
+            if len(image.shape) not in [2, 3]:
+                return False
+            
+            if len(image.shape) == 3 and image.shape[2] not in [1, 3, 4]:
+                return False
+            
+            # Check data type
+            if image.dtype not in [np.uint8, np.uint16, np.float32, np.float64]:
+                return False
+            
+            return True
             
         except Exception as e:
-            logger.error(f"Error in InsightFace liveness check: {e}")
-            return 0.0
+            logger.warning(f"Image format validation failed: {str(e)}")
+            return False
     
-    def _generate_recommendations(self, confidence: float, indicators: Dict[str, float], face_quality: float) -> List[str]:
-        """Generate user recommendations based on detection results and sensitivity"""
-        recommendations = []
-        
-        # Adjust confidence interpretation based on sensitivity
-        if self.sensitivity_mode == "strict":
-            if confidence < 0.4:
-                recommendations.append("Very low liveness confidence - likely spoofing attempt")
-            elif confidence < 0.6:
-                recommendations.append("Low liveness confidence - possible spoofing")
-            elif confidence < 0.7:
-                recommendations.append("Moderate confidence - borderline detection")
-            elif confidence < 0.8:
-                recommendations.append("Good confidence - likely live")
-            else:
-                recommendations.append("High confidence live detection")
-        elif self.sensitivity_mode == "balanced":
-            if confidence < 0.3:
-                recommendations.append("Very low liveness confidence - likely spoofing attempt")
-            elif confidence < 0.5:
-                recommendations.append("Low liveness confidence - possible spoofing")
-            elif confidence < 0.58:
-                recommendations.append("Moderate confidence - borderline detection")
-            elif confidence < 0.75:
-                recommendations.append("Good confidence - likely live")
-            else:
-                recommendations.append("High confidence live detection")
-        else:  # lenient
-            if confidence < 0.25:
-                recommendations.append("Very low liveness confidence - likely spoofing attempt")
-            elif confidence < 0.4:
-                recommendations.append("Low liveness confidence - possible spoofing")
-            elif confidence < 0.45:
-                recommendations.append("Moderate confidence - borderline detection")
-            elif confidence < 0.7:
-                recommendations.append("Good confidence - likely live")
-            else:
-                recommendations.append("High confidence live detection")
-        
-        if face_quality < 0.3:
-            recommendations.append("Improve image quality - move closer or improve lighting")
-        
-        # Specific recommendations based on indicators and sensitivity
-        texture_threshold = 0.3 if self.sensitivity_mode == "strict" else (0.25 if self.sensitivity_mode == "balanced" else 0.2)
-        if indicators.get('texture_richness', 1.0) < texture_threshold:
-            recommendations.append("Image appears very smooth - check for filters or processing")
-        
-        skin_threshold = 0.5 if self.sensitivity_mode == "strict" else (0.4 if self.sensitivity_mode == "balanced" else 0.3)
-        if indicators.get('skin_realism', 1.0) < skin_threshold:
-            recommendations.append("Skin color appears unnatural - check lighting conditions")
-        
-        rgb_threshold = 0.4 if self.sensitivity_mode == "strict" else (0.3 if self.sensitivity_mode == "balanced" else 0.25)
-        if indicators.get('rgb_independence', 1.0) < rgb_threshold:
-            recommendations.append("High RGB correlation detected - avoid screen photos")
-        
-        if indicators.get('reflection_absence', 1.0) < 0.4:
-            recommendations.append("Reflections detected - avoid glossy surfaces")
-        
-        moire_threshold = 0.5 if self.sensitivity_mode == "strict" else (0.4 if self.sensitivity_mode == "balanced" else 0.3)
-        if indicators.get('moire_absence', 1.0) < moire_threshold:
-            recommendations.append("Moiré patterns detected - avoid screen interference")
-        
-        pattern_threshold = 0.7 if self.sensitivity_mode == "strict" else (0.6 if self.sensitivity_mode == "balanced" else 0.5)
-        if indicators.get('screen_pattern_absence', 1.0) < pattern_threshold:
-            recommendations.append("Screen patterns detected - use direct camera capture")
-        
-        return recommendations
-
-# Global instance
-_detector_instance = None
-
-def get_detector_instance(model_path: Optional[str] = None) -> EnhancedLivenessDetector:
-    """Get singleton detector instance"""
-    global _detector_instance
-    if _detector_instance is None:
-        _detector_instance = EnhancedLivenessDetector(model_path)
-    return _detector_instance
-
-def set_detection_sensitivity(mode: str):
-    """Set global detection sensitivity mode"""
-    detector = get_detector_instance()
-    detector.set_sensitivity(mode)
-
-def check_liveness_antispoof_mn3(image: np.ndarray, model_path: Optional[str] = None) -> float:
-    """
-    Enhanced liveness detection function (backward compatible)
-    Returns simple float score for compatibility
-    """
-    detector = get_detector_instance(model_path)
-    result = detector.check_liveness(image, LivenessMethod.ENSEMBLE)
+    def preprocess_image(self, image: np.ndarray) -> np.ndarray:
+        """Preprocess image for optimal analysis"""
+        try:
+            # Validate input
+            if not self.validate_image_format(image):
+                raise ValueError("Invalid image format")
+            
+            # Convert to uint8 if needed
+            if image.dtype != np.uint8:
+                if image.dtype in [np.float32, np.float64]:
+                    image = (image * 255).astype(np.uint8)
+                elif image.dtype == np.uint16:
+                    image = (image / 256).astype(np.uint8)
+            
+            # Resize if too large (for performance)
+            h, w = image.shape[:2]
+            max_size = 1024
+            
+            if max(h, w) > max_size:
+                if h > w:
+                    new_h, new_w = max_size, int(w * max_size / h)
+                else:
+                    new_h, new_w = int(h * max_size / w), max_size
+                
+                image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            
+            # Ensure minimum size
+            min_size = 64
+            if min(h, w) < min_size:
+                scale = min_size / min(h, w)
+                new_h, new_w = int(h * scale), int(w * scale)
+                image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+            
+            return image
+            
+        except Exception as e:
+            logger.error(f"Image preprocessing failed: {str(e)}")
+            raise ValueError(f"Image preprocessing failed: {str(e)}")
     
-    # Log detailed results
-    logger.info(f"Liveness Detection Results:")
-    logger.info(f"  - Is Live: {result.is_live}")
-    logger.info(f"  - Confidence: {result.confidence:.3f}")
-    logger.info(f"  - Method: {result.method_used}")
-    logger.info(f"  - Detection Time: {result.detection_time:.3f}s")
-    logger.info(f"  - Face Quality: {result.face_quality:.3f}")
-    logger.info(f"  - Recommendations: {result.recommendations}")
-    
-    return result.confidence if result.confidence != -1 else -1.0
-
-def check_liveness_enhanced(image: np.ndarray, model_path: Optional[str] = None) -> LivenessResult:
-    """
-    Enhanced liveness detection with detailed results
-    """
-    detector = get_detector_instance(model_path)
-    return detector.check_liveness(image, LivenessMethod.ENSEMBLE)
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """Get performance statistics"""
+        return {
+            'detector_version': self.version,
+            'methods_count': len(self.detection_methods),
+            'face_detection_available': self.face_cascade is not None,
+            'current_threshold': self.default_threshold,
+            'current_sensitivity': self.sensitivity,
+            'supported_formats': self.get_supported_formats(),
+            'max_recommended_size': '1024x1024',
+            'min_recommended_size': '64x64'
+        }
