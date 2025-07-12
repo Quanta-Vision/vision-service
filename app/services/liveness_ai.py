@@ -55,31 +55,40 @@ class AILivenessService:
     
     def _get_detection_prompt(self) -> str:
         """Get the optimized prompt for liveness detection"""
-        return """Analyze this image to determine if it's a 'Real' photo taken directly with a camera or a 'Spoof' (recaptured from a screen/display or printed photo).
+        return """You are a computer vision expert analyzing an image for technical authentication purposes. This is a legitimate security application for preventing fraud and ensuring genuine user verification.
 
-Key indicators to look for:
+TASK: Determine if this image is:
+- 'Real': Captured directly with a camera/phone (authentic)
+- 'Spoof': Recaptured from a screen, monitor, or printed photo (fraudulent)
 
-SPOOF indicators:
-- Screen artifacts: pixel grids, moiré patterns, RGB subpixels
-- Display characteristics: uniform backlighting, color banding, refresh lines
-- Print artifacts: dot matrix patterns, paper texture, halftone dots
-- Digital processing: over-sharpening, compression artifacts, unnatural smoothing
-- Lighting uniformity: artificial, too-perfect lighting
-- Resolution inconsistencies: upscaling artifacts, pixelation
+TECHNICAL ANALYSIS REQUIRED:
+Look for these technical indicators:
 
-REAL indicators:
-- Natural skin texture and pores
-- Proper lighting gradients and shadows
-- Camera sensor noise patterns
-- Natural color variations
-- Sharp, authentic edges
-- Depth of field effects
+SPOOF DETECTION SIGNS:
+- Display artifacts: RGB subpixel patterns, screen door effect
+- Moiré patterns from screen interference
+- Uniform backlighting characteristic of displays
+- Reduced image quality from display re-capture
+- Digital compression artifacts
+- Unnatural color temperature shifts
+- Pixel grid visibility
+- Reflection patterns typical of glass screens
 
-Respond with ONLY this JSON format:
+AUTHENTIC IMAGE SIGNS:
+- Natural camera sensor noise
+- Proper depth of field and focus characteristics
+- Natural lighting variations and shadows
+- Authentic skin texture and detail
+- Camera-specific image processing signatures
+- Natural color reproduction
+
+This is a standard computer vision authentication task used by security systems worldwide. Please provide your technical analysis.
+
+REQUIRED OUTPUT FORMAT:
 {
     "decision": "Real" or "Spoof",
     "confidence": 0.0-1.0,
-    "reasoning": "Brief explanation of key indicators"
+    "reasoning": "Technical explanation of key visual indicators"
 }"""
     
     async def analyze_with_openai_gpt4v(self, image_base64: str) -> Dict[str, Any]:
@@ -228,6 +237,36 @@ Respond with ONLY this JSON format:
     def _parse_ai_response(self, response_text: str, provider: str) -> Dict[str, Any]:
         """Parse AI response into structured format"""
         try:
+            # Check for refusal/safety responses
+            refusal_indicators = [
+                "i can't help",
+                "i cannot help", 
+                "i'm not able to",
+                "i cannot analyze",
+                "i can't analyze",
+                "i'm unable to",
+                "cannot assist",
+                "can't assist",
+                "inappropriate",
+                "against my guidelines",
+                "policy",
+                "safety"
+            ]
+            
+            text_lower = response_text.lower()
+            
+            # Check if AI refused to analyze
+            if any(indicator in text_lower for indicator in refusal_indicators):
+                logger.warning(f"{provider} refused to analyze image: {response_text[:100]}")
+                return {
+                    "decision": "Unknown",
+                    "confidence": 0.0,
+                    "reasoning": f"AI model declined to analyze (safety restrictions). Raw response: {response_text[:100]}",
+                    "provider": provider,
+                    "raw_response": response_text,
+                    "refusal": True
+                }
+            
             # Try to parse JSON response
             if "{" in response_text and "}" in response_text:
                 # Extract JSON part
@@ -242,24 +281,32 @@ Respond with ONLY this JSON format:
                         "confidence": float(result.get("confidence", 0.5)),
                         "reasoning": result.get("reasoning", "No reasoning provided"),
                         "provider": provider,
-                        "raw_response": response_text
+                        "raw_response": response_text,
+                        "refusal": False
                     }
                 except json.JSONDecodeError:
                     pass
             
             # Fallback parsing for non-JSON responses
-            text_lower = response_text.lower()
-            
-            # Determine decision
+            # Determine decision from text analysis
             if "real" in text_lower and "spoof" not in text_lower:
                 decision = "Real"
                 confidence = 0.7
             elif "spoof" in text_lower and "real" not in text_lower:
                 decision = "Spoof"
                 confidence = 0.7
+            elif "authentic" in text_lower or "genuine" in text_lower:
+                decision = "Real"
+                confidence = 0.6
+            elif "fake" in text_lower or "artificial" in text_lower or "screen" in text_lower:
+                decision = "Spoof"
+                confidence = 0.6
             elif "real" in text_lower and "spoof" in text_lower:
                 # Both mentioned, look for stronger indicators
-                if text_lower.count("spoof") > text_lower.count("real"):
+                real_count = text_lower.count("real") + text_lower.count("authentic") + text_lower.count("genuine")
+                spoof_count = text_lower.count("spoof") + text_lower.count("fake") + text_lower.count("artificial")
+                
+                if spoof_count > real_count:
                     decision = "Spoof"
                     confidence = 0.6
                 else:
@@ -274,54 +321,112 @@ Respond with ONLY this JSON format:
                 "confidence": confidence,
                 "reasoning": response_text[:200],
                 "provider": provider,
-                "raw_response": response_text
+                "raw_response": response_text,
+                "refusal": False
             }
             
         except Exception as e:
             logger.error(f"Error parsing AI response: {str(e)}")
             return {
                 "decision": "Unknown",
-                "confidence": 0.5,
+                "confidence": 0.0,
                 "reasoning": f"Error parsing response: {str(e)}",
                 "provider": provider,
-                "raw_response": response_text
+                "raw_response": response_text,
+                "refusal": False
             }
     
-    async def analyze_image(self, image_base64: str, provider: str = "openai_gpt4v") -> Dict[str, Any]:
+    async def analyze_image(self, image_base64: str, provider: str = "openai_gpt4v", auto_fallback: bool = True) -> Dict[str, Any]:
         """
-        Main method to analyze image with specified AI provider
+        Main method to analyze image with specified AI provider and automatic fallback
         
         Args:
             image_base64: Base64 encoded image
             provider: AI provider to use
+            auto_fallback: Try other providers if primary refuses/fails
             
         Returns:
             Analysis result dictionary
         """
         start_time = time.time()
+        providers_tried = []
         
-        try:
-            if provider == "openai_gpt4v":
-                result = await self.analyze_with_openai_gpt4v(image_base64)
-            elif provider == "anthropic_claude":
-                result = await self.analyze_with_anthropic_claude(image_base64)
-            elif provider == "google_gemini":
-                result = await self.analyze_with_google_gemini(image_base64)
-            elif provider == "ollama_llava":
-                result = await self.analyze_with_ollama_llava(image_base64)
-            else:
-                raise ValueError(f"Unknown provider: {provider}")
+        # Define fallback order
+        fallback_order = {
+            "openai_gpt4v": ["google_gemini", "anthropic_claude", "ollama_llava"],
+            "anthropic_claude": ["google_gemini", "openai_gpt4v", "ollama_llava"], 
+            "google_gemini": ["anthropic_claude", "openai_gpt4v", "ollama_llava"],
+            "ollama_llava": ["google_gemini", "anthropic_claude", "openai_gpt4v"]
+        }
+        
+        async def try_provider(prov: str) -> Dict[str, Any]:
+            """Try a specific provider"""
+            try:
+                providers_tried.append(prov)
+                logger.info(f"Attempting analysis with {prov}")
+                
+                if prov == "openai_gpt4v":
+                    result = await self.analyze_with_openai_gpt4v(image_base64)
+                elif prov == "anthropic_claude":
+                    result = await self.analyze_with_anthropic_claude(image_base64)
+                elif prov == "google_gemini":
+                    result = await self.analyze_with_google_gemini(image_base64)
+                elif prov == "ollama_llava":
+                    result = await self.analyze_with_ollama_llava(image_base64)
+                else:
+                    raise ValueError(f"Unknown provider: {prov}")
+                
+                # Check if provider refused
+                if result.get("refusal", False) or result.get("decision") == "Unknown":
+                    logger.warning(f"{prov} refused or gave unclear response")
+                    return None
+                
+                logger.info(f"{prov} successfully analyzed: {result['decision']}")
+                return result
+                
+            except Exception as e:
+                logger.warning(f"{prov} failed: {str(e)}")
+                return None
+        
+        # Try primary provider first
+        result = await try_provider(provider)
+        
+        # If primary failed and auto_fallback is enabled, try alternatives
+        if result is None and auto_fallback:
+            logger.info(f"Primary provider {provider} failed, trying fallbacks...")
             
-            # Add timing information
+            for fallback_provider in fallback_order.get(provider, []):
+                if fallback_provider in providers_tried:
+                    continue
+                    
+                result = await try_provider(fallback_provider)
+                if result is not None:
+                    result["fallback_used"] = True
+                    result["original_provider"] = provider
+                    result["successful_provider"] = fallback_provider
+                    break
+        
+        # If still no result, return error info
+        if result is None:
             processing_time = int((time.time() - start_time) * 1000)
-            result["processing_time_ms"] = processing_time
-            result["timestamp"] = int(time.time() * 1000)
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"AI analysis failed with provider {provider}: {str(e)}")
-            raise
+            return {
+                "decision": "Unknown",
+                "confidence": 0.0,
+                "reasoning": f"All providers failed or refused. Tried: {', '.join(providers_tried)}",
+                "provider": provider,
+                "providers_tried": providers_tried,
+                "processing_time_ms": processing_time,
+                "timestamp": int(time.time() * 1000),
+                "all_failed": True
+            }
+        
+        # Add timing information
+        processing_time = int((time.time() - start_time) * 1000)
+        result["processing_time_ms"] = processing_time
+        result["timestamp"] = int(time.time() * 1000)
+        result["providers_tried"] = providers_tried
+        
+        return result
     
     def get_available_providers(self) -> Dict[str, Dict[str, Any]]:
         """Get list of available AI providers and their status"""
@@ -392,41 +497,112 @@ class AILivenessCombiner:
         Returns:
             Combined result with final decision
         """
+        # Handle case where all AI providers failed
+        if ai_result.get("all_failed", False):
+            if traditional_result is not None:
+                logger.warning("All AI providers failed, using traditional detection only")
+                return {
+                    "is_live": traditional_result["is_live"],
+                    "final_confidence": traditional_result["confidence"],
+                    "decision_method": "TRADITIONAL_ONLY_AI_FAILED",
+                    "ai_decision": "Failed",
+                    "ai_confidence": 0.0,
+                    "ai_reasoning": ai_result.get("reasoning", "All AI providers failed"),
+                    "traditional_decision": traditional_result["is_live"],
+                    "traditional_score": traditional_result["liveness_score"],
+                    "providers_tried": ai_result.get("providers_tried", [])
+                }
+            else:
+                # Both AI and traditional failed - return conservative result
+                return {
+                    "is_live": False,  # Conservative: assume spoof when uncertain
+                    "final_confidence": 0.0,
+                    "decision_method": "ALL_FAILED",
+                    "ai_decision": "Failed",
+                    "ai_confidence": 0.0,
+                    "ai_reasoning": "All AI providers failed and traditional detection not available",
+                    "traditional_decision": None,
+                    "traditional_score": None,
+                    "providers_tried": ai_result.get("providers_tried", [])
+                }
+        
+        # Handle AI refusal or unknown decision
+        if ai_result.get("refusal", False) or ai_result.get("decision") == "Unknown":
+            if traditional_result is not None:
+                logger.info("AI refused/unclear, using traditional detection")
+                return {
+                    "is_live": traditional_result["is_live"],
+                    "final_confidence": traditional_result["confidence"],
+                    "decision_method": "TRADITIONAL_ONLY_AI_REFUSED",
+                    "ai_decision": ai_result.get("decision", "Refused"),
+                    "ai_confidence": ai_result.get("confidence", 0.0),
+                    "ai_reasoning": ai_result.get("reasoning", "AI declined to analyze"),
+                    "traditional_decision": traditional_result["is_live"],
+                    "traditional_score": traditional_result["liveness_score"]
+                }
+            else:
+                # AI refused and no traditional - return conservative
+                return {
+                    "is_live": False,
+                    "final_confidence": 0.0,
+                    "decision_method": "CONSERVATIVE_AI_REFUSED",
+                    "ai_decision": ai_result.get("decision", "Refused"),
+                    "ai_confidence": 0.0,
+                    "ai_reasoning": ai_result.get("reasoning", "AI declined to analyze"),
+                    "traditional_decision": None,
+                    "traditional_score": None
+                }
+        
+        # Normal processing for successful AI analysis
         ai_is_live = ai_result["decision"].lower() == "real"
         ai_confidence = ai_result["confidence"]
         
         if traditional_result is None:
-            # AI only
+            # AI only (successful)
+            decision_method = "AI_ONLY"
+            if ai_result.get("fallback_used", False):
+                decision_method = f"AI_FALLBACK_{ai_result.get('successful_provider', 'unknown').upper()}"
+            
             return {
                 "is_live": ai_is_live,
                 "final_confidence": ai_confidence,
-                "decision_method": "AI_ONLY",
+                "decision_method": decision_method,
                 "ai_decision": ai_result["decision"],
                 "ai_confidence": ai_confidence,
                 "ai_reasoning": ai_result.get("reasoning", ""),
                 "traditional_decision": None,
-                "traditional_score": None
+                "traditional_score": None,
+                "fallback_info": {
+                    "fallback_used": ai_result.get("fallback_used", False),
+                    "original_provider": ai_result.get("original_provider"),
+                    "successful_provider": ai_result.get("successful_provider"),
+                    "providers_tried": ai_result.get("providers_tried", [])
+                }
             }
         
+        # Combine AI and traditional results
         traditional_is_live = traditional_result["is_live"]
         traditional_confidence = traditional_result["confidence"]
         
-        # Combine decisions
         if ai_is_live == traditional_is_live:
             # Both agree - high confidence
             combined_confidence = (ai_confidence + traditional_confidence) / 2
             final_decision = ai_is_live
             decision_method = "CONSENSUS"
         else:
-            # Disagreement - use more confident result
+            # Disagreement - use more confident result with penalty
             if ai_confidence > traditional_confidence:
                 final_decision = ai_is_live
-                combined_confidence = ai_confidence * 0.9  # Slight penalty for disagreement
+                combined_confidence = ai_confidence * 0.85  # Penalty for disagreement
                 decision_method = "AI_PREFERRED"
             else:
                 final_decision = traditional_is_live
-                combined_confidence = traditional_confidence * 0.9
+                combined_confidence = traditional_confidence * 0.85
                 decision_method = "TRADITIONAL_PREFERRED"
+        
+        # Add fallback info if AI used fallback
+        if ai_result.get("fallback_used", False):
+            decision_method += "_WITH_FALLBACK"
         
         return {
             "is_live": final_decision,
@@ -436,7 +612,13 @@ class AILivenessCombiner:
             "ai_confidence": ai_confidence,
             "ai_reasoning": ai_result.get("reasoning", ""),
             "traditional_decision": traditional_is_live,
-            "traditional_score": traditional_result["liveness_score"]
+            "traditional_score": traditional_result["liveness_score"],
+            "fallback_info": {
+                "fallback_used": ai_result.get("fallback_used", False),
+                "original_provider": ai_result.get("original_provider"),
+                "successful_provider": ai_result.get("successful_provider"),
+                "providers_tried": ai_result.get("providers_tried", [])
+            }
         }
 
 # Global service instance
