@@ -10,6 +10,18 @@ import openai
 import anthropic
 import requests
 
+# Import your configuration
+try:
+    from app.core.ai_liveness_config import AIConfig
+except ImportError:
+    # Fallback configuration if config file not found
+    class AIConfig:
+        GOOGLE_API_KEY = "AIzaSyAIeWJCX4YH_u5DbJgIrulPOhrwLwuWm3k"
+        GOOGLE_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+        OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+        ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+        OLLAMA_ENDPOINT = "http://localhost:11434"
+
 logger = logging.getLogger(__name__)
 
 class AILivenessService:
@@ -23,35 +35,43 @@ class AILivenessService:
         """Initialize AI model clients"""
         try:
             # OpenAI GPT-4V
-            self.openai_api_key = os.getenv("OPENAI_API_KEY")
+            self.openai_api_key = AIConfig.OPENAI_API_KEY or os.getenv("OPENAI_API_KEY")
             if self.openai_api_key:
                 self.openai_client = openai.OpenAI(api_key=self.openai_api_key)
-                logger.info("OpenAI GPT-4V client initialized")
+                logger.info("✅ OpenAI GPT-4o client initialized")
             else:
                 self.openai_client = None
-                logger.warning("OpenAI API key not found")
+                logger.warning("⚠️ OpenAI API key not found")
             
             # Anthropic Claude
-            self.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+            self.anthropic_api_key = AIConfig.ANTHROPIC_API_KEY or os.getenv("ANTHROPIC_API_KEY")
             if self.anthropic_api_key:
                 self.anthropic_client = anthropic.Anthropic(api_key=self.anthropic_api_key)
-                logger.info("Anthropic Claude client initialized")
+                logger.info("✅ Anthropic Claude client initialized")
             else:
                 self.anthropic_client = None
-                logger.warning("Anthropic API key not found")
+                logger.warning("⚠️ Anthropic API key not found")
             
-            # Google Gemini
-            self.google_api_key = os.getenv("GOOGLE_API_KEY")
+            # Google Gemini (your specific configuration)
+            self.google_api_key = AIConfig.GOOGLE_API_KEY
+            self.google_api_url = AIConfig.GOOGLE_API_URL
             if self.google_api_key:
-                logger.info("Google Gemini API key found")
+                logger.info("✅ Google Gemini 2.0 Flash configured")
+                logger.info(f"🔑 API Key: {self.google_api_key[:20]}...")
+                logger.info(f"🌐 API URL: {self.google_api_url}")
             else:
-                logger.warning("Google API key not found")
+                logger.warning("⚠️ Google API key not found")
             
             # Ollama (local)
-            self.ollama_endpoint = os.getenv("OLLAMA_ENDPOINT", "http://localhost:11434")
+            self.ollama_endpoint = getattr(AIConfig, 'OLLAMA_ENDPOINT', "http://localhost:11434")
+            logger.info(f"🏠 Ollama endpoint: {self.ollama_endpoint}")
             
         except Exception as e:
             logger.error(f"Error setting up AI clients: {str(e)}")
+            # Set defaults
+            self.google_api_key = "AIzaSyAIeWJCX4YH_u5DbJgIrulPOhrwLwuWm3k"
+            self.google_api_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+            logger.info("📍 Using fallback Google Gemini configuration")
     
     def _get_detection_prompt(self) -> str:
         """Get the optimized prompt for liveness detection"""
@@ -167,12 +187,13 @@ REQUIRED OUTPUT FORMAT:
             raise Exception(f"Claude analysis failed: {str(e)}")
     
     async def analyze_with_google_gemini(self, image_base64: str) -> Dict[str, Any]:
-        """Analyze image using Google Gemini"""
+        """Analyze image using Google Gemini 2.0 Flash (your specific configuration)"""
         if not self.google_api_key:
             raise Exception("Google API not configured")
         
         try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro-vision:generateContent?key={self.google_api_key}"
+            # Use your specific Gemini 2.0 Flash API URL
+            url = f"{self.google_api_url}?key={self.google_api_key}"
             
             payload = {
                 "contents": [{
@@ -188,22 +209,55 @@ REQUIRED OUTPUT FORMAT:
                 }],
                 "generationConfig": {
                     "temperature": 0.1,
-                    "maxOutputTokens": 200
-                }
+                    "maxOutputTokens": 300,
+                    "topP": 0.8,
+                    "topK": 10
+                },
+                "safetySettings": [
+                    {
+                        "category": "HARM_CATEGORY_HARASSMENT",
+                        "threshold": "BLOCK_ONLY_HIGH"
+                    },
+                    {
+                        "category": "HARM_CATEGORY_HATE_SPEECH",
+                        "threshold": "BLOCK_ONLY_HIGH"
+                    },
+                    {
+                        "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                        "threshold": "BLOCK_ONLY_HIGH"
+                    },
+                    {
+                        "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                        "threshold": "BLOCK_ONLY_HIGH"
+                    }
+                ]
             }
             
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=payload, timeout=30) as response:
                     if response.status == 200:
                         result = await response.json()
-                        text = result["candidates"][0]["content"]["parts"][0]["text"]
-                        return self._parse_ai_response(text, "google_gemini")
+                        
+                        # Extract text from Gemini response
+                        try:
+                            text = result["candidates"][0]["content"]["parts"][0]["text"]
+                            logger.info(f"Gemini 2.0 Flash response: {text[:100]}...")
+                            return self._parse_ai_response(text, "google_gemini")
+                        except (KeyError, IndexError) as e:
+                            logger.error(f"Gemini response format error: {e}")
+                            logger.error(f"Full response: {result}")
+                            raise Exception(f"Unexpected Gemini response format: {e}")
+                            
                     else:
                         error_text = await response.text()
+                        logger.error(f"Gemini API error {response.status}: {error_text}")
                         raise Exception(f"Gemini API error: {response.status} - {error_text}")
                         
+        except asyncio.TimeoutError:
+            logger.error("Gemini API request timed out")
+            raise Exception("Gemini API request timed out")
         except Exception as e:
-            logger.error(f"Google Gemini analysis failed: {str(e)}")
+            logger.error(f"Google Gemini 2.0 Flash analysis failed: {str(e)}")
             raise Exception(f"Gemini analysis failed: {str(e)}")
     
     async def analyze_with_ollama_llava(self, image_base64: str) -> Dict[str, Any]:
@@ -431,29 +485,33 @@ REQUIRED OUTPUT FORMAT:
     def get_available_providers(self) -> Dict[str, Dict[str, Any]]:
         """Get list of available AI providers and their status"""
         providers = {
+            "google_gemini": {
+                "name": "Google Gemini 2.0 Flash",
+                "model": "gemini-2.0-flash",
+                "available": bool(self.google_api_key),
+                "description": "Your configured Gemini 2.0 Flash model - Latest Google AI",
+                "cost_estimate": "$0.001-0.005 per image",
+                "speed": "1-2 seconds",
+                "priority": 1,  # Highest priority since it's your configured model
+                "notes": "Your specific configuration - fastest and most cost-effective"
+            },
             "openai_gpt4v": {
                 "name": "OpenAI GPT-4o (Vision)",
                 "model": "gpt-4o",
                 "available": self.openai_client is not None,
                 "description": "Latest OpenAI vision model with improved capabilities",
-                "cost_estimate": "$0.0025-0.01 per image",
-                "speed": "2-4 seconds"
+                "cost_estimate": "$0.005-0.015 per image",
+                "speed": "2-4 seconds",
+                "priority": 2
             },
             "anthropic_claude": {
                 "name": "Anthropic Claude 3.5 Sonnet",
                 "model": "claude-3-5-sonnet-20241022",
                 "available": self.anthropic_client is not None,
                 "description": "Latest Claude with enhanced vision capabilities",
-                "cost_estimate": "$0.003-0.012 per image", 
-                "speed": "2-4 seconds"
-            },
-            "google_gemini": {
-                "name": "Google Gemini Pro Vision",
-                "model": "gemini-pro-vision",
-                "available": self.google_api_key is not None,
-                "description": "Google's multimodal AI model",
-                "cost_estimate": "$0.001-0.005 per image",
-                "speed": "1-3 seconds"
+                "cost_estimate": "$0.008-0.020 per image", 
+                "speed": "2-4 seconds",
+                "priority": 3
             },
             "ollama_llava": {
                 "name": "Ollama LLaVA (Local)",
@@ -461,7 +519,8 @@ REQUIRED OUTPUT FORMAT:
                 "available": True,  # Assume available if endpoint configured
                 "description": "Local vision language model",
                 "cost_estimate": "Free (local)",
-                "speed": "3-8 seconds"
+                "speed": "3-8 seconds",
+                "priority": 4
             }
         }
         

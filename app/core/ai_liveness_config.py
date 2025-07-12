@@ -6,16 +6,18 @@ from typing import Dict, Any
 class AIConfig:
     """Configuration for AI liveness detection"""
     
-    # API Keys (set these in your environment variables)
+    # API Keys (set these in your environment variables or directly here)
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY") 
-    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "AIzaSyAIeWJCX4YH_u5DbJgIrulPOhrwLwuWm3k")  # Your Gemini key
+    GOOGLE_API_URL = os.getenv("GOOGLE_API_URL", "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent")
     
     # Model configurations
-    OPENAI_MODEL = "gpt-4-vision-preview"
-    ANTHROPIC_MODEL = "claude-3-sonnet-20240229"
-    GOOGLE_MODEL = "gemini-pro-vision"
+    OPENAI_MODEL = "gpt-4o"  # Updated model name
+    ANTHROPIC_MODEL = "claude-3-5-sonnet-20241022"  # Updated model
+    GOOGLE_MODEL = "gemini-2.0-flash"  # Your specific Gemini model
     OLLAMA_MODEL = "llava"
+    OLLAMA_ENDPOINT = os.getenv("OLLAMA_ENDPOINT", "http://localhost:11434")
     
     # Timeout settings
     AI_REQUEST_TIMEOUT = 30  # seconds
@@ -27,6 +29,141 @@ class AIConfig:
     # Decision combination weights
     AI_WEIGHT = 0.6
     TRADITIONAL_WEIGHT = 0.4
+    
+    # Provider priority order (most reliable first)
+    PROVIDER_PRIORITY = ["google_gemini", "anthropic_claude", "openai_gpt4v", "ollama_llava"]
+    
+    @classmethod
+    def get_available_providers(cls) -> Dict[str, bool]:
+        """Check which providers are available"""
+        return {
+            "openai_gpt4v": bool(cls.OPENAI_API_KEY),
+            "anthropic_claude": bool(cls.ANTHROPIC_API_KEY),
+            "google_gemini": bool(cls.GOOGLE_API_KEY),
+            "ollama_llava": True  # Assume available if endpoint configured
+        }
+    
+    @classmethod
+    def get_provider_info(cls) -> Dict[str, Dict[str, Any]]:
+        """Get detailed provider information"""
+        return {
+            "openai_gpt4v": {
+                "name": "OpenAI GPT-4o Vision",
+                "model": cls.OPENAI_MODEL,
+                "available": bool(cls.OPENAI_API_KEY),
+                "cost_per_image": "$0.005-0.015",
+                "speed": "2-4 seconds",
+                "accuracy": "Very High"
+            },
+            "anthropic_claude": {
+                "name": "Anthropic Claude 3.5 Sonnet",
+                "model": cls.ANTHROPIC_MODEL,
+                "available": bool(cls.ANTHROPIC_API_KEY),
+                "cost_per_image": "$0.008-0.020", 
+                "speed": "2-4 seconds",
+                "accuracy": "Very High"
+            },
+            "google_gemini": {
+                "name": "Google Gemini 2.0 Flash",
+                "model": cls.GOOGLE_MODEL,
+                "available": bool(cls.GOOGLE_API_KEY),
+                "cost_per_image": "$0.001-0.005",
+                "speed": "1-2 seconds",
+                "accuracy": "High",
+                "notes": "Your configured model - fastest and cheapest"
+            },
+            "ollama_llava": {
+                "name": "Ollama LLaVA (Local)",
+                "model": cls.OLLAMA_MODEL,
+                "available": True,
+                "cost_per_image": "Free",
+                "speed": "3-8 seconds",
+                "accuracy": "Medium-High"
+            }
+        }
+
+# Environment setup helper
+def setup_environment():
+    """Set up environment variables if not already set"""
+    import os
+    
+    # Set your API keys
+    if not os.getenv("GOOGLE_API_KEY"):
+        os.environ["GOOGLE_API_KEY"] = "AIzaSyAIeWJCX4YH_u5DbJgIrulPOhrwLwuWm3k"
+    
+    if not os.getenv("GOOGLE_API_URL"):
+        os.environ["GOOGLE_API_URL"] = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+    
+    print("✅ Google Gemini configuration loaded")
+    print(f"🔑 API Key: {os.getenv('GOOGLE_API_KEY')[:20]}...")
+    print(f"🌐 API URL: {os.getenv('GOOGLE_API_URL')}")
+
+# Call setup when module is imported
+setup_environment()
+
+# Usage examples with your specific configuration
+USAGE_EXAMPLES = {
+    "curl_gemini": """
+# Test with your Gemini API
+curl -X POST "http://localhost:8000/ai-spoof-detect/ai-analyze" \\
+  -F "file=@image.jpg" \\
+  -F "ai_provider=google_gemini" \\
+  -F "combine_traditional=true" \\
+  -F "threshold=0.5"
+""",
+    
+    "python_gemini": """
+import requests
+
+# Test with Gemini (your default provider)
+def test_gemini_liveness(image_path):
+    with open(image_path, 'rb') as f:
+        files = {'file': f}
+        data = {
+            'ai_provider': 'google_gemini',  # Your configured provider
+            'combine_traditional': True,
+            'threshold': 0.5
+        }
+        
+        response = requests.post(
+            'http://localhost:8000/ai-spoof-detect/ai-analyze',
+            files=files,
+            data=data
+        )
+        
+        result = response.json()
+        return result
+
+# Test the API
+result = test_gemini_liveness("test_image.jpg")
+print(f"Is Live: {result['is_live']}")
+print(f"Confidence: {result['final_confidence']}")
+print(f"Provider Used: {result.get('successful_provider', 'google_gemini')}")
+"""
+}
+
+# Requirements for your setup
+REQUIREMENTS_TXT = """
+# Add these to your requirements.txt:
+
+# Core AI packages
+openai>=1.0.0
+anthropic>=0.18.0
+aiohttp>=3.8.0
+
+# For Google API (if using google-generativeai package)
+google-generativeai>=0.3.0
+
+# Additional utilities
+asyncio-throttle>=1.0.0
+python-dotenv>=1.0.0  # For loading .env files
+"""
+
+print("🚀 AI Liveness Configuration Ready!")
+print("📋 Next steps:")
+print("1. Add the requirements to your requirements.txt")
+print("2. Update your services/liveness_ai.py with the new Google API configuration") 
+print("3. Test with: curl or Python client using 'google_gemini' provider")
 
 # requirements_ai.txt - Additional packages needed for AI integration
 """

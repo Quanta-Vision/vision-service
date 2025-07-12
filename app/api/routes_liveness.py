@@ -3,7 +3,7 @@ import time
 import io
 import base64
 from typing import Optional, Dict, Any
-from fastapi import APIRouter, File, UploadFile, HTTPException, Form
+from fastapi import APIRouter, Depends, File, UploadFile, HTTPException, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import cv2
@@ -11,6 +11,7 @@ import numpy as np
 from PIL import Image
 import logging
 from app.services.enhance_liveness_detection import LivenessDetector
+from app.utils.auth import verify_api_key
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -58,7 +59,7 @@ def decode_image(image_data) -> np.ndarray:
         logger.error(f"Error decoding image: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Invalid image format: {str(e)}")
 
-@router_liveness.post("/analyze", response_model=LivenessResponse)
+@router_liveness.post("/analyze", response_model=LivenessResponse, dependencies=[Depends(verify_api_key)])
 async def analyze_liveness_upload(
     file: UploadFile = File(..., description="Image file to analyze"),
     threshold: Optional[float] = Form(0.5, description="Detection threshold")
@@ -105,7 +106,7 @@ async def analyze_liveness_upload(
         logger.error(f"Error in liveness analysis: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
-@router_liveness.post("/analyze-base64", response_model=LivenessResponse)
+@router_liveness.post("/analyze-base64", response_model=LivenessResponse, dependencies=[Depends(verify_api_key)])
 async def analyze_liveness_base64(request: LivenessRequest):
     """
     Analyze base64 encoded image for liveness detection
@@ -141,7 +142,7 @@ async def analyze_liveness_base64(request: LivenessRequest):
         logger.error(f"Error in base64 liveness analysis: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
-@router_liveness.post("/batch-analyze")
+@router_liveness.post("/batch-analyze", dependencies=[Depends(verify_api_key)])
 async def batch_analyze_liveness(
     files: list[UploadFile] = File(..., description="Multiple image files to analyze"),
     threshold: Optional[float] = Form(0.5, description="Detection threshold")

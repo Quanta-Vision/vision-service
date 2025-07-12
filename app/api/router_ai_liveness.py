@@ -2,7 +2,7 @@ import time
 import io
 import base64
 from typing import Optional, Dict, Any
-from fastapi import APIRouter, File, UploadFile, HTTPException, Form
+from fastapi import APIRouter, Depends, File, UploadFile, HTTPException, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import cv2
@@ -13,6 +13,7 @@ import logging
 # Import from your services directory
 from app.services.enhance_liveness_detection import LivenessDetector
 from app.services.liveness_ai import ai_liveness_service, ai_combiner
+from app.utils.auth import verify_api_key
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -66,7 +67,7 @@ def decode_image(image_data) -> np.ndarray:
         logger.error(f"Error decoding image: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Invalid image format: {str(e)}")
 
-@router_ai_liveness.post("/ai-analyze", response_model=AILivenessResponse)
+@router_ai_liveness.post("/ai-analyze", response_model=AILivenessResponse, dependencies=[Depends(verify_api_key)])
 async def analyze_with_ai(
     file: UploadFile = File(..., description="Image file to analyze"),
     ai_provider: str = Form("openai_gpt4v", description="AI provider to use"),
@@ -134,7 +135,7 @@ async def analyze_with_ai(
         logger.error(f"AI analysis failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
-@router_ai_liveness.post("/ai-analyze-base64", response_model=AILivenessResponse)
+@router_ai_liveness.post("/ai-analyze-base64", response_model=AILivenessResponse, dependencies=[Depends(verify_api_key)])
 async def analyze_ai_base64(request: AILivenessRequest):
     """
     Analyze base64 encoded image using AI models
