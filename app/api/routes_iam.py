@@ -3,6 +3,7 @@ from typing import Optional, List
 from app.models.api_keys import (
     create_api_key,
     deactivate_api_key,
+    get_api_keys_by_consumer,
     update_consumer,
     list_all_api_keys,
 )
@@ -27,6 +28,17 @@ async def list_api_keys():
     keys = list_all_api_keys()
     return {"api_keys": keys, "count": len(keys)}
 
+@router_iam.get("/consumer/get-api-key", tags=["IAM"], dependencies=[Depends(verify_admin_key)])
+async def get_api_key_by_consumer(consumer_name: str):
+    keys = get_api_keys_by_consumer(consumer_name)
+    if not keys:
+        raise HTTPException(status_code=404, detail=f"No API keys found for consumer '{consumer_name}'")
+    return {
+        "consumer_name": consumer_name,
+        "api_keys": keys,
+        "count": len(keys)
+    }
+    
 @router_iam.put("/update-consumer", tags=["IAM"], dependencies=[Depends(verify_admin_key)])
 async def update_consumer_api(
     api_key: str = Form(...),

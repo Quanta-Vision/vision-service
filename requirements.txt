@@ -16,3 +16,8 @@ ultralytics
 insightface 
 onnxruntime
 # onnxruntime-gpu
+openai
+anthropic
+google-generativeai 
+redis 
+aiohttp

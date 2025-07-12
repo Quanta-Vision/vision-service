@@ -29,3 +29,7 @@ def update_consumer(api_key, updates: dict):
 
 def list_all_api_keys():
     return list(collection.find({}, {"_id": 0}))
+
+def get_api_keys_by_consumer(consumer_name: str):
+    return list(collection.find({"consumer_name": consumer_name}, {"_id": 0}))
+
