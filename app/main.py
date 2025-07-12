@@ -29,7 +29,7 @@ app.include_router(router_iam, prefix="/iam")
 app.include_router(router_v2, prefix="/v2")
 app.include_router(router_counter, prefix="/counter")
 app.include_router(router_liveness, prefix="/spoof-detect")
-app.include_router(router_ai_liveness, prefix="/ai-spoof-detect")
+app.include_router(router_ai_liveness, prefix="/v2/ai-spoof-detect")
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
